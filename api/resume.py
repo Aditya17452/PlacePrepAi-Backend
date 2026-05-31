@@ -49,13 +49,18 @@ async def upload_resume(
                     student_id TEXT PRIMARY KEY,
                     scraped_summary TEXT,
                     urls_found INTEGER DEFAULT 0,
-                    updated_at DATETIME DEFAULT (datetime('now'))
+                    updated_at TIMESTAMP DEFAULT NOW()
                 )
             """))
             db.execute(
-                text("""INSERT OR REPLACE INTO student_profile_data
+                text("""INSERT INTO student_profile_data
                         (student_id, scraped_summary, urls_found, updated_at)
-                        VALUES (:sid, :summary, :urls, datetime('now'))"""),
+                        VALUES (:sid, :summary, :urls, NOW())
+                        ON CONFLICT (student_id)
+                        DO UPDATE SET
+                            scraped_summary = EXCLUDED.scraped_summary,
+                            urls_found = EXCLUDED.urls_found,
+                            updated_at = NOW()"""),
                 {"sid": student_id, "summary": links_summary, "urls": urls_found}
             )
             db.commit()

@@ -14,9 +14,9 @@ try:
             payment_id TEXT,
             package TEXT,
             credits_added INTEGER,
-            amount REAL,
-            status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT (datetime('now'))
+            amount FLOAT,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """))
     db.commit()

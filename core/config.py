@@ -5,6 +5,7 @@ load_dotenv()
 
 class Settings:
     GROQ_API_KEY: str    = os.getenv("GROQ_API_KEY", "")
+    GROQ_API_KEY2: str   = os.getenv("GROQ_API_KEY2", "")
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
     DATABASE_URL: str    = os.getenv("DATABASE_URL", "")
@@ -29,5 +30,21 @@ class Settings:
     LOCAL_WHISPER_MODEL: str = "tiny"
     EMBEDDING_MODEL: str     = "all-MiniLM-L6-v2"
     TOP_K_JD_CHUNKS: int     = 3
+
+    # ── Google OAuth ──────────────────────────────────────────────────────────
+    GOOGLE_CLIENT_ID: str     = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    GOOGLE_REDIRECT_URI: str  = os.getenv(
+        "GOOGLE_REDIRECT_URI",
+        "http://localhost:8000/api/auth/google/callback"
+    )
+
+    # ── Supabase (optional — used alongside DATABASE_URL) ─────────────────────
+    SUPABASE_URL: str      = os.getenv("SUPABASE_URL", "")
+    SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
+
+    # ── Domain / role control ─────────────────────────────────────────────────
+    ALLOWED_STUDENT_DOMAIN: str = os.getenv("ALLOWED_STUDENT_DOMAIN", "indoreinstitute.com")
+    SUPER_ADMIN_EMAILS: list    = [e.strip() for e in os.getenv("SUPER_ADMIN_EMAILS", "adityachouksey017@gmail.com,darpannaganpuriya@gmail.com").split(",")]
 
 settings = Settings()

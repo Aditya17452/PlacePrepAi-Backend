@@ -98,12 +98,12 @@ def verify_payment(req: VerifyPaymentRequest, db: Session = Depends(get_db)):
 
         if existing:
             db.execute(
-                text("UPDATE student_credits SET credits = credits + :n, total_used = total_used, updated_at = datetime('now') WHERE student_id = :sid"),
+                text("UPDATE student_credits SET credits = credits + :n, total_used = total_used, updated_at = NOW() WHERE student_id = :sid"),
                 {"n": credits_to_add, "sid": req.student_id}
             )
         else:
             db.execute(
-                text("INSERT INTO student_credits (id, student_id, credits, total_used) VALUES (lower(hex(randomblob(16))), :sid, :n, 0)"),
+                text("INSERT INTO student_credits (id, student_id, credits, total_used) VALUES (gen_random_uuid(), :sid, :n, 0)"),
                 {"sid": req.student_id, "n": credits_to_add}
             )
 

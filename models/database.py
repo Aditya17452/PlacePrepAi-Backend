@@ -1,17 +1,35 @@
 from sqlalchemy import (
     create_engine, Column, String, Integer,
-    Float, Text, DateTime, Boolean, JSON
+    Float, Text, DateTime, Boolean, JSON, ForeignKey
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import uuid
+import uuid, os
 from datetime import datetime
 from core.config import settings
 
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args={"check_same_thread": False}
-)
+# ── Engine ─────────────────────────────────────────────────────────────────────
+DATABASE_URL = settings.DATABASE_URL or "sqlite:///./placeprep.db"
+
+# Supabase / Heroku ship "postgres://" — SQLAlchemy 1.4+ requires "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+_is_sqlite = DATABASE_URL.startswith("sqlite")
+
+if _is_sqlite:
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+    )
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -25,13 +43,14 @@ class Student(Base):
     id              = Column(String(36), primary_key=True, default=gen_uuid)
     name            = Column(String(200))
     email           = Column(String(200), unique=True)
-    role            = Column(String(20), default="student")
+    role            = Column(String(20), default="student")   # student / officer / college_admin / super_admin
     cgpa            = Column(Float, default=7.0)
     branch          = Column(String(100), default="Computer Science")
     year_of_passing = Column(Integer, default=2026)
     skills          = Column(JSON, default=list)
     resume_text     = Column(Text, nullable=True)
     password_hash   = Column(String(200), nullable=True)
+    college_id      = Column(String(36), ForeignKey("colleges.id"), nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 
@@ -280,10 +299,43 @@ def seed_jds(db_session):
 
 def create_tables():
     Base.metadata.create_all(bind=engine)
-    print("✅ All SQLite tables created")
+    print("✅ All database tables created / verified")
     # Auto-seed JDs
     db = SessionLocal()
     try:
         seed_jds(db)
     finally:
         db.close()
+
+
+# ── College model (multi-tenant support) ──────────────────────────────────────
+class College(Base):
+    __tablename__ = "colleges"
+    id            = Column(String(36), primary_key=True, default=gen_uuid)
+    name          = Column(String(200), nullable=False)
+    domain        = Column(String(100), nullable=False, unique=True)   # e.g. indoreinstitute.com
+    plan          = Column(Integer, default=100)           # 100 / 300 / 600 students
+    total_credits = Column(Integer, default=500)           # plan × 5
+    credits_used  = Column(Integer, default=0)
+    handler_email = Column(String(200), nullable=True)     # designated institute handler email
+    handler_id    = Column(String(36), nullable=True)      # student.id of the handler account
+    credit_limit  = Column(Integer, default=5)             # per-student credit limit
+    is_active     = Column(Boolean, default=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+
+# ── StudentJD model (custom JD upload feature) ────────────────────────────────
+class StudentJD(Base):
+    """Stores JDs pasted by students and the Groq resume-match result."""
+    __tablename__ = "student_jds"
+    id             = Column(String(36), primary_key=True, default=gen_uuid)
+    student_id     = Column(String(36), nullable=False, index=True)
+    company_name   = Column(String(200), nullable=False)
+    role_title     = Column(String(200), nullable=False)
+    jd_text        = Column(Text, nullable=False)
+    match_pct      = Column(Integer, default=0)
+    matched_skills = Column(Text, default="[]")   # JSON array stored as text
+    missing_skills = Column(Text, default="[]")   # JSON array stored as text
+    advice         = Column(Text, default="")
+    status         = Column(String(20), default="pending")  # pending / complete / failed
+    created_at     = Column(DateTime, default=datetime.utcnow)

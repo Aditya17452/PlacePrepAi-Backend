@@ -9,7 +9,7 @@ try:
             student_id TEXT PRIMARY KEY,
             scraped_summary TEXT,
             urls_found INTEGER DEFAULT 0,
-            updated_at DATETIME DEFAULT (datetime('now'))
+            updated_at TIMESTAMP DEFAULT NOW()
         )
     """))
     db.commit()

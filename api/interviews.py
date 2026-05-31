@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from agents.interview_agent import InterviewAgent
-from services.whisper_service import transcribe_complete
+
 from services.session_service import SessionManager
 from models.database import (
     get_db, InterviewSession, SessionTranscript,
@@ -22,7 +22,28 @@ async def start_interview(body: dict, db: Session = Depends(get_db)):
     jd_id = body.get("jd_id")
 
     student = db.query(Student).filter(Student.id == student_id).first()
-    jd = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
+
+    # ── Custom student JD (new feature — backward-compatible) ─────────────
+    custom_jd_id = body.get("custom_jd_id")
+    jd = None
+    if custom_jd_id:
+        from sqlalchemy import text as _text
+        custom_row = db.execute(
+            _text("SELECT id, company_name, role_title, jd_text FROM student_jds WHERE id=:id"),
+            {"id": custom_jd_id}
+        ).fetchone()
+        if custom_row:
+            class TempJD:
+                id           = custom_row[0]
+                company_name = custom_row[1]
+                role_title   = custom_row[2]
+                jd_text      = custom_row[3]
+                is_active    = True
+            jd = TempJD()
+
+    # Fall back to the normal seeded-JD lookup when no custom JD was resolved
+    if jd is None:
+        jd = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
 
     if not student or not jd:
         student = db.query(Student).first()
@@ -128,23 +149,22 @@ async def interview_ws(
                 # Priority 2: audio blob (WAV from Web Audio API)
                 elif data.get("audio"):
                     try:
-                        audio_bytes = base64.b64decode(data["audio"])
-                        print(f"🎙 Transcribing audio: {len(audio_bytes)} bytes")
-                        result = await asyncio.to_thread(transcribe_complete, audio_bytes)
-                        transcribed = result.get("text", "").strip()
-                        if transcribed:
-                            full_answer = transcribed
-                            print(f"✅ Audio transcript: '{full_answer[:100]}'")
-                        else:
-                            print("⚠️ Whisper returned empty text")
+                        from services.whisper_service import transcribe_with_fallback
+                        transcript = await transcribe_with_fallback(
+                            audio_base64=data.get("audio", ""),
+                            fallback_text=data.get("transcript", "")
+                        )
+                        if transcript:
+                            full_answer = transcript
+                            print(f"✅ Audio transcribed: '{full_answer[:80]}'")
                         await websocket.send_json({
                             "type": "transcript_update",
                             "text": full_answer
                         })
                     except Exception as e:
-                        print(f"❌ Transcription failed: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        print(f"⚠️ Audio processing failed (non-fatal): {e}")
+                        # Use any text that came with the message
+                        full_answer = data.get("transcript", "") or "(audio not transcribed)"
                 else:
                     print("⚠️ No transcript or audio in turn_complete")
 
@@ -291,6 +311,20 @@ async def get_report(session_id: str, db: Session = Depends(get_db)):
         return {"status": "processing"}
     if eval_status == "failed":
         return {"status": "failed"}
+        
+    transcripts = db.query(SessionTranscript).filter(
+        SessionTranscript.session_id == session_id
+    ).order_by(SessionTranscript.turn_number).all()
+
+    breakdown = []
+    for t in transcripts:
+        breakdown.append({
+            "question": t.question,
+            "answer": t.answer,
+            "turn": t.turn_number,
+            "phase": t.phase
+        })
+
     return {
         "status": "complete",
         "overallScore": score.overall_score,
@@ -307,7 +341,7 @@ async def get_report(session_id: str, db: Session = Depends(get_db)):
         "summary": f"Overall verdict: {score.verdict}",
         "tips": score.tips_json or [],
         "topics": score.topics_json or [],
-        "questionBreakdown": []
+        "questionBreakdown": breakdown
     }
 
 

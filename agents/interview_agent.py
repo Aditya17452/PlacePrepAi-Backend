@@ -5,6 +5,21 @@ from services.session_service import SessionManager
 from core.config import settings
 
 client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+client_backup = AsyncGroq(api_key=settings.GROQ_API_KEY2) if getattr(settings, "GROQ_API_KEY2", "") else None
+
+async def _call_groq_with_fallback(messages, max_tokens=120, temperature=0.85):
+    try:
+        return await client.chat.completions.create(
+            model=settings.GROQ_MODEL, messages=messages, max_tokens=max_tokens, temperature=temperature, timeout=20
+        )
+    except Exception as e:
+        print(f"Primary Groq API failed: {e}")
+        if client_backup:
+            print("Attempting with backup GROQ_API_KEY2...")
+            return await client_backup.chat.completions.create(
+                model=settings.GROQ_MODEL, messages=messages, max_tokens=max_tokens, temperature=temperature, timeout=20
+            )
+        raise e
 
 WARMUP_QUESTIONS = [
     "Tell me about yourself — your background, skills, and what drew you to this field.",
@@ -33,7 +48,7 @@ def get_student_profile(db, student_id: str) -> str:
         ).fetchone()
         return row[0] if row and row[0] else ""
     except Exception as e:
-        print(f"⚠️ Could not fetch student profile: {e}")
+        print(f"Could not fetch student profile: {e}")
         return ""
 
 
@@ -60,9 +75,9 @@ class InterviewAgent:
             if student_id:
                 self._profile_context = get_student_profile(db, student_id)
                 if self._profile_context:
-                    print(f"✅ Loaded scraped profile for {student_id[:8]}... ({len(self._profile_context)} chars)")
+                    print(f"Loaded scraped profile for {student_id[:8]}... ({len(self._profile_context)} chars)")
                 else:
-                    print(f"ℹ️ No scraped profile found for {student_id[:8]}...")
+                    print(f"No scraped profile found for {student_id[:8]}...")
             self._profile_loaded = True
         return self._profile_context
 
@@ -100,21 +115,22 @@ class InterviewAgent:
         return False
 
     def _fallback_progression_question(self, q_num: int, answer: str, memory_questions: list[str]) -> str:
+        role = self.jd['role_title']
         if self._is_uninformative_answer(answer):
             candidates = [
-                "No problem. Let us move to fundamentals: explain bias-variance tradeoff and how you reduce overfitting in practice.",
-                "Let us switch to implementation: how would you evaluate a classification model beyond accuracy, and why?",
-                "Imagine your model fails in production. What debugging steps would you follow first?",
-                "How do you choose features and validate that they improve model performance?",
-                "If training time is high, what optimization strategies would you try and in what order?"
+                f"Let us shift focus. What is one core technical concept you believe is essential for a {role} role, and how have you applied it?",
+                f"Could you walk me through a challenging problem you solved recently that is relevant to a {role} position?",
+                "Imagine you are given a project with vague requirements. How would you approach clarifying and executing it?",
+                f"What part of the {role} role do you find most interesting, and what relevant skills do you bring to it?",
+                f"If you had to learn a completely new technology for this {role} role in one week, what would be your strategy?"
             ]
         else:
             candidates = [
                 "Can you share one concrete technical decision from your project and the tradeoff you considered?",
                 "What metric did you optimize in your project, and why was it better than alternatives?",
-                "How did you split data for training and validation, and what leakage risks did you avoid?",
-                "What part of your system was hardest to productionize, and how did you solve it?",
-                "If you had one extra week for that project, what technical improvement would you prioritize?"
+                "How did you structure your solution, and what edge cases did you have to handle?",
+                "What part of your system was hardest to build, and how did you solve it?",
+                "If you had one extra week for that project, what improvement would you prioritize?"
             ]
 
         for question in candidates:
@@ -141,7 +157,7 @@ class InterviewAgent:
 
         # END CHECK
         if q_count >= MAX_QUESTIONS or elapsed >= getattr(settings, "HARD_CUTOFF_MIN", 25):
-            print(f"✅ Session ending: q_count={q_count}, elapsed={elapsed:.1f}min")
+            print(f"Session ending: q_count={q_count}, elapsed={elapsed:.1f}min")
             return {
                 "question": None,
                 "phase": "complete",
@@ -182,7 +198,7 @@ class InterviewAgent:
         if new_count % getattr(settings, "FEEDBACK_EVERY_N", 3) == 0:
             feedback = await self._live_feedback(student_answer)
 
-        print(f"📝 Q{new_count}/{MAX_QUESTIONS} | phase={phase} | elapsed={elapsed:.1f}min")
+        print(f"Q{new_count}/{MAX_QUESTIONS} | phase={phase} | elapsed={elapsed:.1f}min")
 
         return {
             "question": question,
@@ -244,31 +260,32 @@ ROLE-SPECIFIC TOPICS:
 RULES:
 - NEVER repeat any question already in conversation history
 - NEVER ask generic questions like "tell me about yourself" again
-- ALWAYS build on what the candidate just said
-- If profile data is available, ask about SPECIFIC projects/repos/stats you can see
+- ALWAYS build on what the candidate just said OR transition smoothly to a new topic from the ROLE REQUIREMENTS
+- CRITICAL: Focus strictly on evaluating the candidate for the {self.jd['role_title']} role. While you may reference their background, DO NOT ask domain-specific questions about their past degrees/branch if they are irrelevant to the current job description.
+- If profile data or past projects are available, only tie them to the challenges they would face in this role if they are relevant.
 - ONE question only, max 2 sentences
 - NO compliments, NO "Great answer!"
-- Sound like a real senior engineer
+- Sound like a real senior engineer diving deep into their background
+- If an answer is shallow or uninformative, probe deeper on fundamental concepts instead
+- IMPORTANT: The candidate's answers are generated via Speech-to-Text. Forgive minor typos, homophones, or incorrectly transcribed words. Infer their true meaning based on context (e.g. "python pandas" instead of "python pan does").
 
 Output ONLY the question. Nothing else."""
 
         for attempt in range(3):
             try:
-                response = await client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
+                response = await _call_groq_with_fallback(
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": f"Candidate said: \"{answer[:300]}\"\n\nNext question:"}
                     ],
                     max_tokens=120,
-                    temperature=0.85,
-                    timeout=20
+                    temperature=0.85
                 )
                 question = (response.choices[0].message.content or "").strip().strip('"')
-                print(f"✅ Groq Q{q_num}: {question[:80]}")
+                print(f"Groq Q{q_num}: {question[:80]}")
                 return question
             except Exception as e:
-                print(f"⚠️ Groq attempt {attempt + 1} failed: {e}")
+                print(f"Groq attempt {attempt + 1} failed: {e}")
                 if attempt < 2:
                     await asyncio.sleep(2)
 
@@ -300,21 +317,19 @@ Give one specific actionable tip."""
 
         for attempt in range(2):
             try:
-                resp = await client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
+                resp = await _call_groq_with_fallback(
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": user_msg}
                     ],
                     max_tokens=100,
-                    temperature=0.5,
-                    timeout=10
+                    temperature=0.5
                 )
                 raw = (resp.choices[0].message.content or "").strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
                 return json.loads(raw)
             except Exception as e:
-                print(f"⚠️ Feedback attempt {attempt + 1} failed: {e}")
+                print(f"Feedback attempt {attempt + 1} failed: {e}")
                 if attempt < 1:
                     await asyncio.sleep(1)
 
@@ -330,7 +345,7 @@ Give one specific actionable tip."""
             ).order_by(SessionTranscript.turn_number).all()
 
             if len(rows) < 3:
-                print(f"⚠️ Only {len(rows)} answers recorded — returning incomplete scores")
+                print(f"Only {len(rows)} answers recorded — returning incomplete scores")
                 return self._incomplete_scores(len(rows))
 
             transcript_text = "\n".join(
@@ -347,7 +362,15 @@ Give one specific actionable tip."""
         finally:
             db.close()
 
-        prompt = """You are a senior technical interviewer evaluating a mock interview.
+        prompt = """You are a senior technical interviewer and hiring manager evaluating a mock interview.
+Evaluate with high professional standards based on the overall impact of the student:
+1. Clarity of thought & structure
+2. Depth of technical understanding vs shallow buzzwords
+3. Problem-solving approach
+4. Communication effectiveness
+
+IMPORTANT: The candidate's answers were recorded via Speech-to-Text (whisper). Please FORGIVE and smartly correct minor transcription errors, homophones, or misheard technical jargon. Evaluate their INTENDED meaning based on context.
+
 Evaluate honestly — shallow or short answers should score 20-40, not 65.
 A candidate who gave very few answers or one-word replies scores below 30.
 Return ONLY valid JSON. No markdown. No backticks.
@@ -360,7 +383,7 @@ Required format:
   "overall_score": 0-100,
   "verdict": "Good",
   "topics": [
-    {"name": "Topic Name", "score": 0-100, "feedback": "one specific sentence"}
+    {"name": "Topic Name", "score": 0-100, "feedback": "one specific professional sentence"}
   ],
   "strengths": ["strength 1", "strength 2", "strength 3"],
   "improvements": ["area 1", "area 2", "area 3"],
@@ -385,31 +408,29 @@ Do NOT give default 65 scores — evaluate what was actually said."""
 
         for attempt in range(3):
             try:
-                resp = await client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
+                resp = await _call_groq_with_fallback(
                     messages=[
                         {"role": "system", "content": prompt},
                         {"role": "user", "content": user_msg}
                     ],
                     max_tokens=900,
-                    temperature=0.3,
-                    timeout=35
+                    temperature=0.3
                 )
                 raw = (resp.choices[0].message.content or "").strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
                 result = json.loads(raw)
-                print(f"✅ Evaluation: overall={result.get('overall_score')}, verdict={result.get('verdict')}")
+                print(f"Evaluation: overall={result.get('overall_score')}, verdict={result.get('verdict')}")
                 return result
             except json.JSONDecodeError as e:
-                print(f"⚠️ Eval JSON parse failed attempt {attempt + 1}: {e}")
+                print(f"Eval JSON parse failed attempt {attempt + 1}: {e}")
                 if attempt < 2:
                     await asyncio.sleep(3)
             except Exception as e:
-                print(f"⚠️ Eval attempt {attempt + 1} failed: {e}")
+                print(f"Eval attempt {attempt + 1} failed: {e}")
                 if attempt < 2:
                     await asyncio.sleep(3)
 
-        print("❌ All evaluation attempts failed")
+        print("All evaluation attempts failed")
         return self._incomplete_scores(len(rows) if 'rows' in dir() else 0)
 
     def _incomplete_scores(self, answers_given: int = 0) -> dict:
@@ -476,7 +497,7 @@ Format:
                 raw = (resp.choices[0].message.content or "").strip().replace("```json","").replace("```","").strip()
                 return json.loads(raw).get("ranked", [])
             except Exception as e:
-                print(f"⚠️ Resume match attempt {attempt + 1} failed: {e}")
+                print(f"Resume match attempt {attempt + 1} failed: {e}")
                 if attempt < 2:
                     await asyncio.sleep(2)
 
@@ -507,7 +528,7 @@ Return ONLY valid JSON:
                 raw = (resp.choices[0].message.content or "").strip().replace("```json","").replace("```","").strip()
                 return json.loads(raw).get("ranked", [])
             except Exception as e:
-                print(f"⚠️ Shortlist attempt {attempt + 1} failed: {e}")
+                print(f"Shortlist attempt {attempt + 1} failed: {e}")
                 if attempt < 1:
                     await asyncio.sleep(2)
         return []
@@ -516,7 +537,7 @@ Return ONLY valid JSON:
         if posture_score < settings.POSTURE_WARNING_THRESHOLD:
             if self.session.can_warn_posture():
                 self.session.mark_warned()
-                return "Try to sit up straight and maintain eye contact 😊"
+                return "Try to sit up straight and maintain eye contact "
         return None
 
     def _should_end(self, q_count: int, elapsed: float) -> bool:
