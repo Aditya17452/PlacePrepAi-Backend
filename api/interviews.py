@@ -224,7 +224,7 @@ async def interview_ws(
                 if result["session_complete"]:
                     await websocket.send_json({
                         "type": "session_complete",
-                        "message": "Interview complete! Generating your report..."
+                        "message": "Thank you for your time. This concludes our interview. Please wait while I generate your report."
                     })
                     break
 
@@ -284,14 +284,28 @@ async def get_history(student_id: str, db: Session = Depends(get_db)):
     for s in sessions:
         score = db.query(SessionScore).filter(SessionScore.session_id == s.id).first()
         jd = db.query(JobDescription).filter(JobDescription.id == s.jd_id).first()
+        
+        company_name = "Unknown"
+        role_title = "Unknown"
+        if jd:
+            company_name = jd.company_name
+            role_title = jd.role_title
+        else:
+            from sqlalchemy import text
+            custom_row = db.execute(text("SELECT company_name, role_title FROM student_jds WHERE id=:id"), {"id": s.jd_id}).fetchone()
+            if custom_row:
+                company_name = custom_row[0]
+                role_title = custom_row[1]
+
         started_at = getattr(s, "started_at", None)
         date_str = ""
         if isinstance(started_at, datetime):
             date_str = started_at.strftime("%b %d, %Y")
+            
         result.append({
             "id": str(s.id),
-            "company": jd.company_name if jd else "Unknown",
-            "role": jd.role_title if jd else "Unknown",
+            "company": company_name,
+            "role": role_title,
             "date": date_str,
             "score": score.overall_score if score else 0,
             "status": "Completed"

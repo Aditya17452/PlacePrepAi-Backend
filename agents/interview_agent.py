@@ -231,6 +231,8 @@ Use this to ask SPECIFIC questions about their actual projects. For example:
 - Ask about sections visible on their portfolio
 """
 
+        asked_qs = "\n".join(f"- {m.get('q', '')}" for m in self.session.get_memory())
+
         prompt = f"""You are a senior technical interviewer conducting a real placement interview.
 
 ROLE: {self.jd['role_title']}
@@ -242,6 +244,9 @@ CANDIDATE:
 {profile_section}
 ROLE REQUIREMENTS:
 {jd_context}
+
+PREVIOUSLY ASKED QUESTIONS (DO NOT ASK THESE OR ANYTHING SIMILAR):
+{asked_qs}
 
 CONVERSATION SO FAR:
 {history}
@@ -258,18 +263,16 @@ ROLE-SPECIFIC TOPICS:
 - AIML: neural networks, deep learning, model optimization, feature engineering
 
 RULES:
-- NEVER repeat any question already in conversation history
-- NEVER ask generic questions like "tell me about yourself" again
-- ALWAYS build on what the candidate just said OR transition smoothly to a new topic from the ROLE REQUIREMENTS
-- CRITICAL: Focus strictly on evaluating the candidate for the {self.jd['role_title']} role. While you may reference their background, DO NOT ask domain-specific questions about their past degrees/branch if they are irrelevant to the current job description.
-- If profile data or past projects are available, only tie them to the challenges they would face in this role if they are relevant.
-- ONE question only, max 2 sentences
+- NEVER repeat any question already in conversation history. If a similar question was asked, you MUST choose a completely different topic.
+- CRITICAL: Focus strictly on evaluating the candidate for the {self.jd['role_title']} role based ONLY on the ROLE REQUIREMENTS provided above.
+- DO NOT ask domain-specific questions about their past degrees/branch if they are irrelevant to the current job description.
+- IRRELEVANT ANSWER HANDLING: If the candidate's previous answer is completely irrelevant, nonsensical, or dodges the question (e.g. typing gibberish or answering about something completely unrelated), you MUST start your response with: "Your answer seems irrelevant to the question." or "Let's stay on topic." and then ask the next technical question from the JD.
+- ONE question only, max 2 sentences.
 - NO compliments, NO "Great answer!"
-- Sound like a real senior engineer diving deep into their background
-- If an answer is shallow or uninformative, probe deeper on fundamental concepts instead
-- IMPORTANT: The candidate's answers are generated via Speech-to-Text. Forgive minor typos, homophones, or incorrectly transcribed words. Infer their true meaning based on context (e.g. "python pandas" instead of "python pan does").
+- Sound like a real senior engineer diving deep into their background.
+- IMPORTANT: The candidate's answers are generated via Speech-to-Text. Forgive minor typos, homophones, or incorrectly transcribed words. Infer their true meaning based on context.
 
-Output ONLY the question. Nothing else."""
+Output ONLY your response/question. Nothing else."""
 
         for attempt in range(3):
             try:
