@@ -25,3 +25,7 @@ frontend/dist/
 frontend/.env
 # Database dumps taken before migrations (see RUNBOOK.md).
 backups/
+
+# uv cache, kept on the project drive (cross-drive persist fails on Windows).
+.uv-cache/
+.uv-python/

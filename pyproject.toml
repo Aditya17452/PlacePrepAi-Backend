@@ -1,13 +1,48 @@
-# Tooling configuration only.
-#
-# Dependencies live in requirements.txt / requirements-dev.txt, NOT here. Declaring
-# `[project].dependencies` makes Vercel treat this as a uv project and run
-# `uv sync --locked`, which fails without a committed uv.lock. requirements.txt is the
-# install manifest for every environment, so there is one source of truth.
-#
-#   runtime deps : requirements.txt
-#   dev deps     : requirements-dev.txt
-#   python       : .python-version (3.11 — minor pin; the patch level is the platform's)
+[project]
+name = "placeprep-backend"
+version = "2.0.0"
+description = "PlacePrep AI backend — AI mock interviews for college placements"
+# 3.11 is the floor the code needs (StrEnum, datetime.UTC). Vercel deploys on 3.12,
+# which is the only version its Python runtime offers — see .python-version.
+requires-python = ">=3.11,<3.14"
+
+# Vercel's FastAPI preset runs `uv sync --locked` whatever this file says, so the
+# project is declared properly and uv.lock is committed. requirements.txt is kept in
+# step with this list for local pip installs and for non-Vercel environments.
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  "python-multipart==0.0.20",
+  "pydantic==2.10.4",
+  "pydantic-settings==2.7.0",
+  "email-validator==2.2.0",
+  "SQLAlchemy==2.0.36",
+  "alembic==1.14.0",
+  "psycopg2-binary==2.9.10",
+  "PyJWT==2.10.1",
+  "bcrypt==4.2.1",
+  "pyotp==2.9.0",
+  "httpx==0.28.1",
+  "groq==0.13.1",
+  "razorpay==1.4.2",
+  "redis==5.2.1",
+  "pdfplumber==0.11.4",
+  "PyMuPDF==1.25.1",
+  "python-docx==1.1.2",
+  "beautifulsoup4==4.12.3",
+  "lxml==5.3.0",
+  "structlog==24.4.0",
+  "sentry-sdk[fastapi]==2.19.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.25.0",
+  "ruff==0.8.4",
+  "mypy==1.14.0",
+  "freezegun==1.5.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
