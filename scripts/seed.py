@@ -12,11 +12,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.jd_templates import JD_TEMPLATES  # noqa: E402
-from data.plans import ALL_PLANS  # noqa: E402
-from models.billing import Plan  # noqa: E402
-from models.database import JobDescription, SessionLocal  # noqa: E402
-from services.rag_service import index_jd  # noqa: E402
+from app.models import (  # noqa: E402
+    JobDescription,
+    Plan,  # noqa: E402
+    SessionLocal,
+)
+from app.seeds.jd_templates import JD_TEMPLATES  # noqa: E402
+from app.seeds.plans import ALL_PLANS  # noqa: E402
+from app.services.rag_service import index_jd  # noqa: E402
 
 
 def seed_plans(db) -> int:  # type: ignore[no-untyped-def]
@@ -67,7 +70,7 @@ def seed_job_descriptions(db) -> tuple[int, int]:  # type: ignore[no-untyped-def
 
 def backfill_jd_chunks(db) -> int:  # type: ignore[no-untyped-def]
     """Index every JD that has no chunks yet, including ones created before Phase 1."""
-    from models.database import JDChunk
+    from app.models import JDChunk
 
     total = 0
     for jd in db.query(JobDescription).all():

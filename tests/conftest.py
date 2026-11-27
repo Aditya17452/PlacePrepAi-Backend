@@ -32,11 +32,11 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_db_file.as_posix()}"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from core import kv  # noqa: E402
-from core.roles import Role  # noqa: E402
-from core.security import hash_password, make_access_token  # noqa: E402
-from models.database import Base, College, SessionLocal, Student, engine  # noqa: E402
-from services import token_service  # noqa: E402
+from app.core import kv  # noqa: E402
+from app.core.roles import Role  # noqa: E402
+from app.core.security import hash_password, make_access_token  # noqa: E402
+from app.models import Base, College, SessionLocal, Student, engine  # noqa: E402
+from app.services import token_service  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -61,9 +61,10 @@ def db():
 
 @pytest.fixture
 def client():
-    import main
+    from app.main import create_app
 
-    with TestClient(main.app) as test_client:
+    # Built per test through the factory, so no module-level app leaks state between them.
+    with TestClient(create_app()) as test_client:
         yield test_client
 
 

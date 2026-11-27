@@ -1,5 +1,7 @@
 .env
-data/
+# Datasets at the repo root only. An unanchored `data/` also matched
+# app/data/, which silently dropped the seed-data package from a commit.
+/data/
 model/weights/
 __pycache__/
 *.pyc

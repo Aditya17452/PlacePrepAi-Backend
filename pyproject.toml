@@ -1,28 +1,76 @@
+[project]
+name = "placeprep-backend"
+version = "2.0.0"
+description = "PlacePrep AI backend — AI mock interviews for college placements"
+requires-python = ">=3.11,<3.12"
+
+# Dependencies are declared here as the source of truth. requirements.txt is kept
+# because Vercel's Python runtime installs from it; it is generated from this list.
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  "python-multipart==0.0.20",
+  "pydantic==2.10.4",
+  "pydantic-settings==2.7.0",
+  "email-validator==2.2.0",
+  "SQLAlchemy==2.0.36",
+  "alembic==1.14.0",
+  "psycopg2-binary==2.9.10",
+  "PyJWT==2.10.1",
+  "bcrypt==4.2.1",
+  "pyotp==2.9.0",
+  "httpx==0.28.1",
+  "groq==0.13.1",
+  "razorpay==1.4.2",
+  "redis==5.2.1",
+  "pdfplumber==0.11.4",
+  "PyMuPDF==1.25.1",
+  "python-docx==1.1.2",
+  "beautifulsoup4==4.12.3",
+  "lxml==5.3.0",
+  "structlog==24.4.0",
+  "sentry-sdk[fastapi]==2.19.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.25.0",
+  "ruff==0.8.4",
+  "mypy==1.14.0",
+  "freezegun==1.5.1",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --tb=short"
 asyncio_mode = "auto"
+markers = [
+  "integration: exercises the database or the HTTP app",
+]
 
 [tool.ruff]
 line-length = 95
 target-version = "py311"
+# Generated migration bodies are not ours to format.
 exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W"]
-ignore = ["E501", "B008"]
+ignore = [
+  "E501",  # line length is enforced by the formatter, not the linter
+  "B008",  # FastAPI's Depends()/File() in defaults is the documented idiom
+]
 
 [tool.ruff.lint.isort]
-# Declared explicitly rather than inferred: ruff's src detection depends on the
-# checkout path, so without this the same file passes in one clone and fails in
-# another with a spurious I001.
-known-first-party = [
-  "agents",
-  "api",
-  "core",
-  "data",
-  "models",
-  "scripts",
-  "services",
-  "tests",
-]
+# Declared explicitly rather than inferred: ruff's src detection depends on the checkout
+# path, so without this the same file passes in one clone and fails in another with a
+# spurious I001.
+known-first-party = ["app", "tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# Not yet gating CI: annotations are being completed module by module.
+files = ["app"]
+plugins = []

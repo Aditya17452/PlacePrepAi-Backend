@@ -11,11 +11,11 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 
 from alembic import context
-from core.config import settings
+from app.core.config import settings
 
 # Importing this registers every table on Base.metadata, which autogenerate compares
 # against the live schema.
-from models.database import Base  # noqa: F401
+from app.models import Base  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
