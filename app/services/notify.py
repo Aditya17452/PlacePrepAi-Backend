@@ -51,4 +51,6 @@ async def send_sms_code(*, to: str, code: str, purpose: str) -> None:
         log.warning("sms_code_not_sent_local", to=to, purpose=purpose, code=code)
         return
 
-    raise NotificationUnavailable("No SMS provider configured (set SMS_API_KEY)")
+    # Says which of the two it is, so an operator is not left guessing whether the
+    # channel is off on purpose or simply unconfigured.
+    raise NotificationUnavailable(f"SMS is not available: {sms_provider.status()}")

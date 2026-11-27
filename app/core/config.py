@@ -110,12 +110,27 @@ class Settings(BaseSettings):
     SCRAPE_MAX_BYTES: int = 2_000_000
 
     # ── Notifications (OTP delivery) ──────────────────────────────────────────
-    # No provider is wired up yet; see services/notify.py. Locally codes go to the log.
+    # Email goes through Resend. Locally, with no key set, codes go to the log.
     EMAIL_FROM: str = "PlacePrep AI <no-reply@placeprepai.fun>"
     RESEND_API_KEY: str = ""
+    # SMS goes through MSG91. Kept behind a flag that stays false until the DLT
+    # template is approved: sending before then is rejected by the carrier, and a
+    # silent rejection looks exactly like a delivered message from our side.
+    SMS_ENABLED: bool = False
     SMS_API_KEY: str = ""
+    MSG91_TEMPLATE_ID: str = ""
+    MSG91_SENDER_ID: str = ""
     OTP_TTL_SEC: int = 600
     OTP_MAX_ATTEMPTS: int = 5
+
+    # ── Consent (India DPDP Act) ──────────────────────────────────────────────
+    # Bump a version when the notice text changes: an old consent then stops counting
+    # as current, and the student is asked again rather than silently carried over.
+    CONSENT_VERSION_PROCTORING: str = "2026-11-27"
+    CONSENT_VERSION_PROFILE: str = "2026-11-27"
+    CONSENT_VERSION_COLLEGE_SHARING: str = "2026-11-27"
+    # A proctored interview cannot start without a current proctoring consent.
+    REQUIRE_PROCTORING_CONSENT: bool = True
 
     # ── Scheduled jobs ────────────────────────────────────────────────────────
     # Vercel Cron sends this as a bearer token. Without it the cron endpoints

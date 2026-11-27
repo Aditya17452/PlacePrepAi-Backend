@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import Admin, CurrentUser, DbSession
 from app.core import audit, ratelimit
 from app.core.config import settings
 from app.core.logging_setup import get_logger
@@ -34,6 +34,8 @@ from app.models import College, Student, utcnow
 from app.schemas import (
     LoginRequest,
     MeResponse,
+    MfaConfirmRequest,
+    MfaSetupResponse,
     OAuthExchangeRequest,
     OAuthUrlResponse,
     RegisterRequest,
@@ -559,3 +561,92 @@ def _verify_totp(secret: str | None, code: str) -> bool:
 
     # One step of drift either way, for clock skew on the user's phone.
     return bool(pyotp.TOTP(secret).verify(code, valid_window=1))
+
+
+# ── TOTP enrolment ────────────────────────────────────────────────────────────
+# PLAN.md §7.1 makes TOTP mandatory for admin accounts. Verification already existed
+# in `login`; this is the enrolment half, which was missing — so the requirement was
+# unenforceable in practice.
+
+
+@router.post("/mfa/setup", response_model=MfaSetupResponse)
+async def mfa_setup(principal: Admin, db: DbSession) -> MfaSetupResponse:
+    """Generate a TOTP secret and the otpauth URI for an authenticator app.
+
+    The secret is stored but `mfa_enabled` stays false until `/mfa/confirm` proves the
+    authenticator works — otherwise a mistyped setup would lock the admin out of their
+    own account on the next sign-in.
+
+    Calling this again before confirming issues a fresh secret, which is what someone
+    who abandoned a half-finished enrolment expects. Once enabled it refuses, so an
+    attacker holding a live session cannot quietly swap the second factor.
+    """
+    import pyotp
+
+    student = db.query(Student).filter(Student.id == principal.id).first()
+    if student is None:  # pragma: no cover
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+
+    if getattr(student, "mfa_enabled", False):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Two-factor authentication is already enabled on this account.",
+        )
+
+    secret = pyotp.random_base32()
+    student.mfa_secret = secret
+    db.commit()
+
+    account = student.email or principal.id
+    uri = pyotp.TOTP(secret).provisioning_uri(name=account, issuer_name="PlacePrep AI")
+    log.info("mfa_setup_started", student_id=principal.id)
+    return MfaSetupResponse(
+        secret=secret,
+        otpauth_uri=uri,
+        issuer="PlacePrep AI",
+        account=account,
+        already_enabled=False,
+    )
+
+
+@router.post("/mfa/confirm", response_model=SimpleOk)
+async def mfa_confirm(
+    body: MfaConfirmRequest, request: Request, principal: Admin, db: DbSession
+) -> SimpleOk:
+    """Verify a code from the authenticator and turn TOTP on.
+
+    Signs the account out everywhere on success: the next sign-in must present the
+    second factor, so a session created before enrolment cannot outlive it.
+    """
+    await ratelimit.limit_by_user(principal.id, "mfa_confirm", "10/600")
+
+    student = db.query(Student).filter(Student.id == principal.id).first()
+    if student is None:  # pragma: no cover
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    if not student.mfa_secret:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Start enrolment first — there is no pending secret for this account.",
+        )
+    if not _verify_totp(student.mfa_secret, body.code):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That code is not correct. Check your authenticator's clock and try again.",
+        )
+
+    student.mfa_enabled = True
+    student.token_version = int(getattr(student, "token_version", 0) or 0) + 1
+    audit.record(
+        db,
+        action="auth.mfa_enabled",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        ip=ratelimit.client_ip(request),
+    )
+    db.commit()
+    log.info("mfa_enabled", student_id=principal.id)
+    return SimpleOk(
+        ok=True,
+        message="Two-factor authentication is on. Sign in again with your "
+        "authenticator code.",
+    )

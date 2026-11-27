@@ -49,7 +49,7 @@ from app.schemas import (
     SubmitTurnRequest,
     SubmitTurnResponse,
 )
-from app.services import interview_agent, session_service, token_service
+from app.services import consent, interview_agent, session_service, token_service
 from app.services.interview_flow import (
     candidate_profile,
     decode_audio,
@@ -83,6 +83,18 @@ async def start_interview(
     student = db.query(Student).filter(Student.id == principal.id).first()
     if student is None:  # pragma: no cover
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+
+    # A proctored session records camera and microphone observations, so it cannot start
+    # without a current proctoring consent. Checked here rather than trusted from the
+    # client, which is where the agreement used to live and nowhere else.
+    if body.proctoring_enabled and settings.REQUIRE_PROCTORING_CONSENT:
+        if not consent.has_current(db, student_id=principal.id, kind="proctoring"):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Proctoring consent is required before a proctored interview can start. "
+                f"Accept the current notice (version {consent.current_version('proctoring')}) "
+                "and try again.",
+            )
 
     role_title, company = "", ""
     if body.custom_jd_id:

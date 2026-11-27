@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.logging_setup import get_logger
 from app.core.roles import Role, normalize_role
 from app.core.security import hash_password
+from app.integrations import sms as sms_provider
 from app.models import (
     ApiAuditLog,
     College,
@@ -455,7 +456,7 @@ async def config_check(principal: Admin) -> dict:
         "supabase_storage": bool(settings.SUPABASE_SERVICE_ROLE_KEY),
         "github_token": bool(settings.GITHUB_TOKEN),
         "email_provider": bool(settings.RESEND_API_KEY),
-        "sms_provider": bool(settings.SMS_API_KEY),
+        "sms_provider": sms_provider.status(),
         "sentry": bool(settings.SENTRY_DSN),
     }
 
