@@ -856,6 +856,25 @@ Set in the Vercel dashboard (backend project → Settings → Environment Variab
 | `CRON_SECRET` | preview, production | Same. Vercel sends it as `Authorization: Bearer` to the cron endpoints; without it they return 503 and refuse to run. |
 | `RAZORPAY_WEBHOOK_SECRET` | preview | Comes from the Razorpay dashboard when the webhook is created, so it does not exist until Step 4's webhook step. |
 
+#### 2026-11-28: both were added, but to the wrong target
+
+`filter_project_envs` shows `JWT_SECRET` and `CRON_SECRET` present with
+`target: ["production"]` only, so a `target=preview` deployment still boots without
+them. A deployment created from `feat/phase1-backend-gaps` after they were added
+failed at import with the same message.
+
+Verified at the same time that `JWT_SECRET` is the **only** startup gate under
+`ENV=preview`: `_validate_for_environment` checks just `JWT_SECRET` and
+`DATABASE_URL` outside production, and `DATABASE_URL` already covers preview.
+`CRON_SECRET` is not validated at startup — without it the two cron endpoints
+return 503 but the app serves normally. Importing `app.main` with `ENV=preview`,
+`PLACEPREP_ENV_FILE=""` and a throwaway SQLite URL succeeds (71 routes), so no
+second import-time failure is waiting behind this one.
+
+Preview gets its **own** generated values rather than a copy of production's: a
+shared signing key would make a JWT minted on an unprotected preview deployment
+valid against production.
+
 ### Everything else already configured
 
 22 variables set via the API, secrets marked `sensitive` so their values are not
