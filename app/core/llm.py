@@ -53,6 +53,22 @@ STT_USD_PER_HOUR: dict[str, float] = {
 }
 
 
+def _pricing() -> dict[str, tuple[float, float]]:
+    """Built-in prices, overridden by LLM_PRICING_JSON when set.
+
+    The §9 cost-per-interview guardrail is only as good as these numbers, and a vendor
+    changing a price should not need a deploy.
+    """
+    if not settings.LLM_PRICING_JSON:
+        return PRICING
+    try:
+        override = json.loads(settings.LLM_PRICING_JSON)
+        return {**PRICING, **{k: (float(v[0]), float(v[1])) for k, v in override.items()}}
+    except (json.JSONDecodeError, ValueError, TypeError, IndexError) as exc:
+        log.warning("llm_pricing_override_invalid", error=str(exc)[:120])
+        return PRICING
+
+
 def model_for(task: Task) -> str:
     return {
         Task.QUESTION: settings.LLM_MODEL_QUESTION,
@@ -99,7 +115,7 @@ class Usage:
         if self.task is Task.STT:
             rate = STT_USD_PER_HOUR.get(self.model, 0.0)
             return (self.audio_seconds / 3600.0) * rate
-        prompt_rate, completion_rate = PRICING.get(self.model, (0.0, 0.0))
+        prompt_rate, completion_rate = _pricing().get(self.model, (0.0, 0.0))
         return (
             self.prompt_tokens * prompt_rate + self.completion_tokens * completion_rate
         ) / 1_000_000

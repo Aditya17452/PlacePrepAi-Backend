@@ -76,7 +76,12 @@ class Settings(BaseSettings):
     LLM_MODEL_CHEAP: str = "openai/gpt-oss-20b"
     LLM_MODEL_FALLBACK: str = ""
     STT_MODEL: str = "whisper-large-v3-turbo"
+    # Per-1M-token prices as JSON, so a price change or a new model does not need a
+    # deploy: {"openai/gpt-oss-120b": [0.15, 0.60]}. Empty means use the built-in table.
+    LLM_PRICING_JSON: str = ""
 
+    # Groq's free tier allows far fewer concurrent requests than a paid key. This is
+    # the knob that adapts to the plan: raise it after upgrading, no code change.
     LLM_TIMEOUT_SEC: float = 20.0
     LLM_MAX_RETRIES: int = 2
     LLM_MAX_CONCURRENCY: int = 8
@@ -136,6 +141,14 @@ class Settings(BaseSettings):
     # Vercel Cron sends this as a bearer token. Without it the cron endpoints
     # refuse to run rather than being callable by anyone.
     CRON_SECRET: str = ""
+    # How many queued jobs one cron invocation drains. On Vercel Hobby crons fire once
+    # a day, so this has to be generous; on Pro, where the schedule can be minutes,
+    # a smaller batch keeps each invocation short.
+    CRON_DRAIN_BATCH: int = 25
+    # A report that is still pending may drain its own evaluation job inline. This is
+    # what makes reports appear within seconds on Hobby, where the cron is daily.
+    # Turn it off once the cron runs frequently enough to keep up.
+    OPPORTUNISTIC_DRAIN: bool = True
 
     # ── Uploads ───────────────────────────────────────────────────────────────
     MAX_UPLOAD_BYTES: int = 5_242_880  # 5 MB
@@ -147,6 +160,13 @@ class Settings(BaseSettings):
     HARD_CUTOFF_MIN: int = 25
     WARMUP_QUESTIONS: int = 2
     FEEDBACK_EVERY_N: int = 3
+    # How many JD chunks are injected into a question prompt. Dropped by accident when
+    # this module was rewritten as pydantic-settings, which made every interview turn
+    # raise AttributeError in rag_service — caught by the first test that submitted a
+    # turn, not by the 129 that came before it.
+    TOP_K_JD_CHUNKS: int = 3
+    # Seconds between posture nudges, so the same warning is not repeated every frame.
+    POSTURE_WARN_COOLDOWN_SEC: int = 60
 
     # ── Tokens / quota ────────────────────────────────────────────────────────
     TOKEN_CONSUME_AFTER_ANSWERS: int = 3

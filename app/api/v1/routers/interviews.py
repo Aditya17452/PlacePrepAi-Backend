@@ -61,6 +61,7 @@ from app.services.interview_flow import (
 from app.services.jd_context import jd_labels, jd_text_for
 from app.services.rag_service import retrieve_jd_context
 from app.services.session_service import InterviewState
+from app.workers import jobs
 
 log = get_logger("interviews")
 
@@ -405,6 +406,18 @@ async def get_report(
         .filter(ProctoringSummary.session_id == session_id)
         .first()
     )
+
+    if score is not None and score.evaluation_status == "pending" and settings.OPPORTUNISTIC_DRAIN:
+        # On Vercel Hobby the cron runs once a day, so waiting for it would leave this
+        # report "processing" for up to 24 hours. Run this session's own evaluation now.
+        # Claimed the same way the worker claims it, so a concurrent cron cannot double-run.
+        if await jobs.drain_one(db, dedupe_key=f"evaluate:{session_id}"):
+            db.expire_all()
+            score = (
+                db.query(SessionScore)
+                .filter(SessionScore.session_id == session_id)
+                .first()
+            )
 
     if score is None or score.evaluation_status == "pending":
         return ReportResponse(

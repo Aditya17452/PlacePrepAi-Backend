@@ -150,6 +150,63 @@ def _claim(db: Session, worker: str) -> JobQueue | None:
     return job
 
 
+async def drain_one(db: Session, *, dedupe_key: str) -> bool:
+    """Run one specific queued job now, identified by its dedupe key.
+
+    Exists for the free-tier case: Vercel Hobby fires cron once a day, so a report
+    waiting on its evaluation would sit in "processing" for up to 24 hours. The report
+    endpoint calls this for its own session, which turns that into a few seconds.
+
+    Claims the row the same way the worker does, so a concurrent cron run cannot execute
+    the same job twice. Returns True if a job was run to completion.
+    """
+    now = utcnow()
+    job = (
+        db.query(JobQueue)
+        .filter(
+            JobQueue.dedupe_key == dedupe_key,
+            JobQueue.status == "queued",
+            JobQueue.run_after <= now,
+        )
+        .with_for_update(skip_locked=True)
+        .first()
+    )
+    if job is None:
+        return False
+
+    handler = _HANDLERS.get(job.kind)
+    if handler is None:  # pragma: no cover - registered at import
+        return False
+
+    job.status = "running"
+    job.locked_at = now
+    job.locked_by = "inline"
+    db.commit()
+
+    try:
+        await handler(db, job.payload or {})
+    except Exception as exc:
+        db.rollback()
+        job = db.query(JobQueue).filter(JobQueue.id == job.id).first()
+        if job is not None:
+            job.attempts = int(job.attempts) + 1
+            job.last_error = str(exc)[:1000]
+            job.locked_at = None
+            job.locked_by = None
+            # Hand it back to the queue rather than killing it: the cron will retry.
+            job.status = "dead" if job.attempts >= int(job.max_attempts) else "queued"
+            db.commit()
+        log.warning("inline_job_failed", kind=dedupe_key, error=str(exc)[:200])
+        return False
+
+    job.status = "done"
+    job.finished_at = utcnow()
+    job.last_error = None
+    db.commit()
+    log.info("inline_job_done", dedupe_key=dedupe_key)
+    return True
+
+
 def requeue_stale(db: Session, *, older_than_minutes: int = 15) -> int:
     """Return jobs stuck in `running` to the queue.
 

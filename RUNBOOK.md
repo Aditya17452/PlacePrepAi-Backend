@@ -280,3 +280,59 @@ logs `ratelimit_backend_unavailable`.
   but there is no enrolment endpoint yet.
 - **Frontend.** Still calls the old WebSocket and credit endpoints. The backend contract
   changed; see PLAN.md Phase 1c.
+
+---
+
+## Free tier: what is constrained, and the upgrade swap list
+
+Everything plan-specific is an environment variable. Moving to paid plans is an env
+change and a redeploy — no code change, nothing to rebuild.
+
+### Current posture
+
+| Service | Plan | What it costs us |
+|---|---|---|
+| Supabase | Free | Project pauses after ~7 days idle; no on-demand backup; no PITR |
+| Vercel | Hobby | Cron fires **once a day**, max **2 jobs** per project; short function timeout |
+| Groq | Free key | Very low concurrency and requests/minute |
+| Razorpay | Test mode | No real money moves |
+| SMS (MSG91) | Off | Phone OTP returns 503; DLT template not approved |
+| Upstash | Free | Request cap per day |
+
+### How each constraint is handled
+
+- **Supabase pausing.** A daily `GET /api/cron/keepalive` reads from Postgres and pings
+  Redis. It deliberately does real work: a 200 that never reached Postgres would keep the
+  cron green while the project paused anyway.
+- **Daily cron, 2 jobs.** The two slots are `keepalive` and `maintenance`. `maintenance`
+  does *all* the periodic work — drains the job queue, expires token lots, purges
+  snapshots — because there is no third slot for `drain-jobs`.
+- **A daily drain would leave reports pending for up to 24 hours.** So a report that is
+  still `processing` drains its own evaluation job inline (`OPPORTUNISTIC_DRAIN=true`),
+  claiming the row the same way the worker does so a concurrent cron cannot double-run
+  it. Reports appear in seconds instead.
+- **Groq concurrency.** `LLM_MAX_CONCURRENCY=2` and `RATE_LIMIT_LLM=12/60`. When the key
+  is saturated the turn endpoint returns **503 with a readable message** and the browser
+  retries with backoff, then offers a Retry button. It never invents a question to paper
+  over it, and a turn that hit backpressure is not half-written, so the retry is clean.
+- **Supabase pooler connections.** `DB_POOL_SIZE=1`, `DB_MAX_OVERFLOW=2`, because many
+  short-lived functions share a small Free-tier connection allowance.
+
+### Swap list — Free to paid
+
+| Upgrade | Change | Effect |
+|---|---|---|
+| **Supabase Pro** | `DB_POOL_SIZE=5`, `DB_MAX_OVERFLOW=10` | More concurrent interviews. Also turn on PITR; the dashboard gains on-demand backups, so the manual `pg_dump` becomes a belt rather than the only snapshot. |
+| | Remove the `keepalive` cron | Pro projects do not pause. Frees a cron slot if you stay on Hobby. |
+| **Vercel Pro** | Add `{ "path": "/api/cron/drain-jobs", "schedule": "*/5 * * * *" }` to `vercel.json`; set `CRON_DRAIN_BATCH=5` | Queue drains every 5 minutes. |
+| | `OPPORTUNISTIC_DRAIN=false` | The inline drain becomes unnecessary work on a GET once cron keeps up. |
+| **Groq paid** | `LLM_MAX_CONCURRENCY=8..16`, `RATE_LIMIT_LLM=60/60` | Raise until p95 turn latency degrades, not beyond. Watch `llm_usage` for `ok=false`. |
+| | `LLM_MODEL_QUESTION` / `LLM_MODEL_GRADER` | Swap models without a deploy. Benchmark grading agreement first (PLAN.md §10). |
+| | `LLM_PRICING_JSON` | Keeps cost-per-interview accurate after a price change. The §9 guardrail depends on it. |
+| **Razorpay live** | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` | Startup **refuses** a `rzp_test_` key when `ENV=production`, so a half-switched deploy fails loudly. Do a full test-mode pass first. |
+| **SMS live** | `SMS_ENABLED=true`, `SMS_API_KEY`, `MSG91_TEMPLATE_ID`, `MSG91_SENDER_ID` | Only after DLT approval. The template variable must be named `otp`. `/api/super/config-check` reports which state it is in. |
+| **Upstash paid** | No change | Same REST URL and token. |
+| **Email** | `RESEND_API_KEY` (starts `re_`) | Until this is set, email OTP returns 503 in production rather than claiming a code was sent. |
+
+Nothing in that table touches application code. If an upgrade ever seems to need a code
+change, that is a bug in how the value is wired, not a plan limitation.
