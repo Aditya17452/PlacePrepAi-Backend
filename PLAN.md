@@ -892,16 +892,74 @@ backend preview plus `/api`. The existing production value was left untouched.
 `ENV=preview` rather than `production` is deliberate: `ENV=production` refuses an
 `rzp_test_` Razorpay key, so a preview on test-mode payments has to be `preview`.
 
+### Step 4 outcome — backend preview is live (2026-11-28)
+
+Deployment `dpl_AeJANWJ9p7DUTYsGNMAUsWsXgaGv`, commit `3cd84e5`, `environment=preview`.
+Stable branch alias (survives redeploys of this branch):
+
+```
+https://placeprepai-backend-git-feat-phase-2a2332-aditya17452s-projects.vercel.app
+```
+
+Evidence, all fetched live:
+
+| Check | Result |
+|---|---|
+| `GET /health` | `200 {"status":"ok","env":"preview","version":"2.0.0"}` |
+| `GET /ready` | `200 {"status":"ready","database":true,"redis":true,"detail":{}}` |
+| `GET /api/payments/plans` | `200`, 4 real plan rows out of Supabase through the session pooler |
+| `GET /api/auth/me` unauthenticated | app logged `status: 401, duration_ms: 1` — rejected, not crashed |
+| startup log | `env=preview version=2.0.0 question_model=openai/gpt-oss-120b` |
+| error-level runtime logs | none |
+
+So Supabase and Upstash are both reachable from `iad1`, and the startup guard passes.
+
+#### Two dead-host bugs found and fixed while verifying
+
+`placeprepai-backend-aditya17452s-projects.vercel.app` is listed among the project's
+domains but has **no deployment assigned** — `main` has never built successfully — so it
+404s. Two variables pointed at it:
+
+| Variable | Was | Now |
+|---|---|---|
+| `GOOGLE_REDIRECT_URI` (backend, preview) | project alias + `/api/auth/google/callback` | branch alias + same path |
+| `VITE_API_BASE_URL` (frontend, preview) | project alias + `/api` | branch alias + `/api` |
+
+The frontend one was my own error from the earlier Step 4 pass: the frontend preview
+would have called a host that does not resolve. Production values on both projects were
+untouched.
+
+#### Deployment protection blocks Step 5
+
+Both projects have `ssoProtection: {enabled: true, deploymentType: "all_except_custom_domains"}`,
+so **every `*.vercel.app` URL demands a Vercel login** — including the API. A browser on
+the frontend preview calling the backend preview gets Vercel's login page, not JSON, and
+`fetch` sees an opaque failure. The verification above only worked because the Vercel API
+can mint a temporary share link, which a browser and `curl` do not have.
+
+Protection Bypass for Automation is a Pro feature, so on Hobby the practical options are:
+
+1. Turn Vercel Authentication **off** on both projects while testing (dashboard →
+   Settings → Deployment Protection). Simplest; the previews become publicly reachable,
+   which is why it needs an explicit decision — the API talks to the real Supabase
+   database and the real Groq key.
+2. Test production-style through the custom domain `www.placeprepai.fun`, which is
+   exempt from the protection — but that means merging to `main` first, which inverts
+   the agreed order (verify on preview, then merge).
+
 ### Still to do in Step 4
 
-- Add the backend preview callback to the Google console's Authorized redirect URIs:
-  `https://placeprepai-backend-aditya17452s-projects.vercel.app/api/auth/google/callback`
+- Add the backend preview callback to the Google console's Authorized redirect URIs,
+  verbatim:
+  `https://placeprepai-backend-git-feat-phase-2a2332-aditya17452s-projects.vercel.app/api/auth/google/callback`
 - Create the Razorpay test-mode webhook pointing at
-  `<backend preview>/api/payments/webhook` for `payment.captured`, `payment.failed`,
-  `order.paid`, `refund.processed`, then set `RAZORPAY_WEBHOOK_SECRET`.
-- **Vercel SSO protection is on** for the frontend project (`all_except_custom_domains`),
-  so preview URLs demand Vercel login. Step 5's automated run needs either a protection
-  bypass token or testing through the custom domain.
+  `<branch alias>/api/payments/webhook` for `payment.captured`, `payment.failed`,
+  `order.paid`, `refund.processed`, then set `RAZORPAY_WEBHOOK_SECRET` (preview target).
+  Until it exists, a test payment cannot grant tokens: tokens are granted only from the
+  verified webhook, never from the client.
+- Decide the deployment-protection question above before Step 5.
 - Resend domain `placeprepai.fun` is `not_started`: until the DKIM records are added,
   email only sends from `onboarding@resend.dev` and only reaches the Resend account
   owner. OTP will work for your own testing, not for other students.
+- Rotate the credentials that were pasted into chat (GitHub PAT, Groq key, Supabase
+  database password) now that the deployment is working.
