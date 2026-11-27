@@ -86,9 +86,25 @@ def budget_for(task: Task) -> int:
         Task.GRADER: settings.LLM_TOKEN_BUDGET_GRADER,
         Task.EVALUATOR: settings.LLM_TOKEN_BUDGET_EVALUATOR,
         Task.EXTRACTOR: settings.LLM_TOKEN_BUDGET_GRADER,
-        Task.CHEAP: 160,
+        Task.CHEAP: settings.LLM_TOKEN_BUDGET_CHEAP,
         Task.STT: 0,
     }[task]
+
+
+def reasoning_effort_for(task: Task) -> str | None:
+    """How hard the model should think before answering.
+
+    Writing a question or a coaching tip does not need deep reasoning and the tokens are
+    billed either way; grading and final evaluation do.
+    """
+    if not settings.LLM_SEND_REASONING_EFFORT:
+        return None
+    deep = {Task.GRADER, Task.EVALUATOR, Task.EXTRACTOR}
+    return (
+        settings.LLM_REASONING_EFFORT_DEEP
+        if task in deep
+        else settings.LLM_REASONING_EFFORT_FAST
+    )
 
 
 class LLMError(RuntimeError):
@@ -97,6 +113,15 @@ class LLMError(RuntimeError):
 
 class LLMBusy(LLMError):
     """Upstream rate limit. Callers should surface backpressure, not a fake answer."""
+
+
+class LLMTruncated(LLMError):
+    """The token budget ran out before the model finished.
+
+    Distinct from an empty or refused answer: with a reasoning model this means the
+    reasoning consumed the budget, and the fix is a bigger budget or lower effort — not
+    a retry of the same call.
+    """
 
 
 @dataclass
@@ -347,21 +372,42 @@ async def _complete(
             started = time.perf_counter()
             try:
                 async with _gate():
-                    text, prompt_tokens, completion_tokens = await provider.complete(
+                    (
+                        text,
+                        prompt_tokens,
+                        completion_tokens,
+                        finish_reason,
+                    ) = await provider.complete(
                         model=model,
                         messages=messages,
                         max_tokens=budget,
                         temperature=temperature,
                         json_mode=json_mode,
                         timeout=settings.LLM_TIMEOUT_SEC,
+                        reasoning_effort=reasoning_effort_for(task),
                     )
                 usage.prompt_tokens = prompt_tokens
                 usage.completion_tokens = completion_tokens
                 usage.latency_ms = int((time.perf_counter() - started) * 1000)
                 record_usage(usage, session_id=session_id, student_id=student_id)
+
+                if finish_reason == "length" and not text:
+                    # The budget went on reasoning. Say so, rather than reporting an
+                    # empty response and sending the caller looking for the wrong cause.
+                    raise LLMTruncated(
+                        f"{model} used its whole {budget}-token budget on reasoning and "
+                        "returned no answer. Raise the task budget or lower "
+                        "LLM_REASONING_EFFORT_*."
+                    )
                 if not text:
                     raise LLMError("Model returned an empty response")
                 return text, usage
+
+            except LLMTruncated:
+                # Not retryable: the same call with the same budget truncates again, and
+                # the fallback key would too. Propagate the specific error so the caller
+                # — and the log — name the real cause instead of a generic failure.
+                raise
 
             except Exception as exc:
                 last_exc = exc
@@ -388,13 +434,19 @@ async def _complete(
         log.warning("llm_trying_fallback_model", task=task.value, model=fallback_model)
         try:
             async with _gate():
-                text, prompt_tokens, completion_tokens = await candidates[0].complete(
+                (
+                    text,
+                    prompt_tokens,
+                    completion_tokens,
+                    _finish,
+                ) = await candidates[0].complete(
                     model=fallback_model,
                     messages=messages,
                     max_tokens=budget,
                     temperature=temperature,
                     json_mode=json_mode,
                     timeout=settings.LLM_TIMEOUT_SEC,
+                    reasoning_effort=reasoning_effort_for(task),
                 )
             usage = Usage(
                 model=fallback_model,

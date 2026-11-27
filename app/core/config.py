@@ -8,6 +8,7 @@ running with one.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -20,9 +21,23 @@ Env = Literal["local", "preview", "production"]
 _FORBIDDEN_SECRETS = {"secret", "changeme", "please-change-me", ""}
 
 
+def _env_file() -> str | None:
+    """Which dotenv file to load, if any.
+
+    `PLACEPREP_ENV_FILE=""` disables dotenv loading entirely. The test suite sets that,
+    so tests cannot read local credentials and therefore cannot reach — or pollute —
+    real Redis, Resend, Groq or Supabase. Before this, adding real values to `.env` made
+    six tests fail by silently hitting the live Upstash instance.
+    """
+    configured = os.getenv("PLACEPREP_ENV_FILE")
+    if configured is None:
+        return ".env"
+    return configured or None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_env_file(),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
@@ -85,9 +100,20 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SEC: float = 20.0
     LLM_MAX_RETRIES: int = 2
     LLM_MAX_CONCURRENCY: int = 8
-    LLM_TOKEN_BUDGET_QUESTION: int = 200
-    LLM_TOKEN_BUDGET_GRADER: int = 600
-    LLM_TOKEN_BUDGET_EVALUATOR: int = 1_200
+    # These budgets include REASONING tokens. gpt-oss models emit reasoning before the
+    # answer and it counts against max_tokens, so a budget sized for the answer alone
+    # gets consumed by reasoning and the content comes back empty. Measured: a realistic
+    # question prompt used 108 completion tokens at default effort, 46 at "low".
+    LLM_TOKEN_BUDGET_QUESTION: int = 600
+    LLM_TOKEN_BUDGET_GRADER: int = 1_800
+    LLM_TOKEN_BUDGET_EVALUATOR: int = 3_000
+    LLM_TOKEN_BUDGET_CHEAP: int = 500
+    # Reasoning effort, passed through to Groq. "low" cut completion tokens roughly 4x
+    # with no loss of question quality; grading keeps more depth.
+    LLM_REASONING_EFFORT_FAST: str = "low"
+    LLM_REASONING_EFFORT_DEEP: str = "medium"
+    # Turn off if a future model rejects the parameter.
+    LLM_SEND_REASONING_EFFORT: bool = True
 
     # ── Google OAuth ──────────────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""
