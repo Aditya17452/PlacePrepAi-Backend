@@ -1,298 +1,200 @@
+"""Student-pasted job descriptions and their resume match.
+
+Fixes in Phase 1:
+
+* **Authenticated and ownership-checked.** `student_id` came from the request body or the
+  path, so one student could list, create against, or delete another student's JDs.
+* **Durable background work.** The match ran in `asyncio.create_task`, which is lost on
+  any restart — the card stayed "pending" forever. It is a queued job now.
+* **No request-time DDL.** Every endpoint called `StudentJD.__table__.create(...)`.
+* **Indexed for retrieval.** A JD is chunked into `jd_chunks` on creation, so the
+  interview actually has requirements to ground its questions in — that table was empty
+  in production.
 """
-api/jd_upload.py  ── Student custom JD upload & resume-match feature
-New endpoints (all backward-compatible, touch nothing else):
-  POST   /api/jd/submit
-  GET    /api/jd/list/{student_id}
-  GET    /api/jd/status/{jd_id}
-  DELETE /api/jd/delete/{jd_id}?student_id=...
-"""
+
+from __future__ import annotations
 
 import json
-import uuid
-import asyncio
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import BaseModel, Field
 
-from models.database import get_db, SessionLocal, StudentJD, Base, engine
-from core.config import settings
+from api.deps import CurrentUser, DbSession
+from core import audit, ratelimit
+from core.llm import LLMError, Task, complete_structured
+from core.logging_setup import get_logger
+from models.database import Student, StudentJD
+from models.schemas import SimpleOk, StudentJDOut, SubmitJDRequest
+from services import jobs, rag_service
 
-router = APIRouter(prefix="/api/jd", tags=["student_jds"])
+log = get_logger("student_jd")
 
-
-# ── DB helper ─────────────────────────────────────────────────────────────────
-
-def _ensure_student_jds_table(db: Session) -> None:
-    """Idempotent: ensure student_jds table exists via SQLAlchemy (works on any DB)."""
-    try:
-        StudentJD.__table__.create(bind=engine, checkfirst=True)
-    except Exception:
-        pass  # already exists — safe to ignore
+router = APIRouter(prefix="/api/jd", tags=["job_descriptions"])
 
 
-
-# ── Pydantic schemas ───────────────────────────────────────────────────────────
-
-class SubmitJDRequest(BaseModel):
-    student_id:   str
-    company_name: str
-    role_title:   str
-    jd_text:      str
+class _JDMatch(BaseModel):
+    match_pct: int = Field(ge=0, le=100)
+    matching_skills: list[str] = Field(default_factory=list, max_length=12)
+    missing_skills: list[str] = Field(default_factory=list, max_length=12)
+    advice: str = Field(default="", max_length=400)
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.post("/submit")
-async def submit_jd(req: SubmitJDRequest, db: Session = Depends(get_db)):
-    """
-    Student submits a custom JD.
-    Returns immediately with {id, status: 'pending'}.
-    Background task does the Groq resume-match and updates the row.
-    """
-    _ensure_student_jds_table(db)
-
-    jd_text_clean = req.jd_text.strip()
-    if len(jd_text_clean) < 50:
-        raise HTTPException(status_code=400, detail="JD text too short (min 50 chars)")
-
-    jd_id = str(uuid.uuid4())
-
-    db.execute(text("""
-        INSERT INTO student_jds
-            (id, student_id, company_name, role_title, jd_text, status)
-        VALUES
-            (:id, :sid, :company, :role, :jd_text, 'pending')
-    """), {
-        "id":      jd_id,
-        "sid":     req.student_id,
-        "company": req.company_name.strip(),
-        "role":    req.role_title.strip(),
-        "jd_text": jd_text_clean,
-    })
-    db.commit()
-
-    # Fire-and-forget background matching
-    asyncio.create_task(
-        _match_jd_async(jd_id, req.student_id, jd_text_clean)
+def _to_out(row: StudentJD) -> StudentJDOut:
+    return StudentJDOut(
+        id=str(row.id),
+        company_name=row.company_name,
+        role_title=row.role_title,
+        match_pct=int(row.match_pct or 0),
+        matched_skills=_safe_list(row.matched_skills),
+        missing_skills=_safe_list(row.missing_skills),
+        advice=row.advice or "",
+        status=row.status,
+        created_at=row.created_at,
     )
 
-    return {"id": jd_id, "status": "pending"}
 
-
-@router.get("/list/{student_id}")
-def get_student_jds(student_id: str, db: Session = Depends(get_db)):
-    """Return all JDs submitted by a student, newest first."""
-    _ensure_student_jds_table(db)
-
-    rows = db.execute(text("""
-        SELECT id, company_name, role_title,
-               match_pct, matched_skills, missing_skills,
-               advice, status, created_at
-        FROM   student_jds
-        WHERE  student_id = :sid
-        ORDER  BY created_at DESC
-    """), {"sid": student_id}).fetchall()
-
-    return [
-        {
-            "id":             r[0],
-            "company_name":   r[1],
-            "role_title":     r[2],
-            "match_pct":      r[3] or 0,
-            "matched_skills": _safe_json(r[4]),
-            "missing_skills": _safe_json(r[5]),
-            "advice":         r[6] or "",
-            "status":         r[7],
-            "created_at":     r[8],
-        }
-        for r in rows
-    ]
-
-
-@router.get("/status/{jd_id}")
-def get_jd_status(jd_id: str, db: Session = Depends(get_db)):
-    """Poll for the current match status of a single JD."""
-    _ensure_student_jds_table(db)
-
-    row = db.execute(text("""
-        SELECT id, company_name, role_title,
-               match_pct, matched_skills, missing_skills,
-               advice, status
-        FROM   student_jds
-        WHERE  id = :id
-    """), {"id": jd_id}).fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="JD not found")
-
-    return {
-        "id":             row[0],
-        "company_name":   row[1],
-        "role_title":     row[2],
-        "match_pct":      row[3] or 0,
-        "matched_skills": _safe_json(row[4]),
-        "missing_skills": _safe_json(row[5]),
-        "advice":         row[6] or "",
-        "status":         row[7],
-    }
-
-
-@router.delete("/delete/{jd_id}")
-def delete_student_jd(
-    jd_id:      str,
-    student_id: str,
-    db:         Session = Depends(get_db),
-):
-    """Delete a JD (only if it belongs to the given student)."""
-    _ensure_student_jds_table(db)
-
-    db.execute(text("""
-        DELETE FROM student_jds
-        WHERE  id = :id AND student_id = :sid
-    """), {"id": jd_id, "sid": student_id})
-    db.commit()
-
-    return {"success": True}
-
-
-# ── Background matching task ───────────────────────────────────────────────────
-
-async def _match_jd_async(jd_id: str, student_id: str, jd_text: str) -> None:
-    """
-    Fetches the student's stored resume_text, calls Groq to get a match result,
-    then updates the student_jds row.  Runs as a background asyncio task.
-    """
-    db = SessionLocal()
+def _safe_list(value: str | None) -> list[str]:
     try:
-        # Get resume text from students table
-        row = db.execute(
-            text("SELECT resume_text FROM students WHERE id = :sid"),
-            {"sid": student_id}
-        ).fetchone()
-        resume_text = (row[0] or "").strip() if row else ""
-
-        if not resume_text:
-            db.execute(text("""
-                UPDATE student_jds
-                SET    status  = 'complete',
-                       match_pct = 0,
-                       advice  = 'No resume found. Please upload your resume first.'
-                WHERE  id = :id
-            """), {"id": jd_id})
-            db.commit()
-            print(f"⚠️  JD {jd_id[:8]}: no resume for student {student_id[:8]}")
-            return
-
-        result = await _groq_match(resume_text, jd_text)
-
-        db.execute(text("""
-            UPDATE student_jds
-            SET    match_pct      = :pct,
-                   matched_skills = :matched,
-                   missing_skills = :missing,
-                   advice         = :advice,
-                   status         = 'complete'
-            WHERE  id = :id
-        """), {
-            "pct":     int(result.get("match_pct", 0)),
-            "matched": json.dumps(result.get("matching_skills", [])),
-            "missing": json.dumps(result.get("missing_skills", [])),
-            "advice":  result.get("advice", ""),
-            "id":      jd_id,
-        })
-        db.commit()
-        print(f"✅ JD {jd_id[:8]} matched: {result.get('match_pct')}%")
-
-    except Exception as e:
-        print(f"❌ JD match async error for {jd_id[:8]}: {e}")
-        try:
-            db.execute(
-                text("UPDATE student_jds SET status='failed' WHERE id=:id"),
-                {"id": jd_id}
-            )
-            db.commit()
-        except Exception:
-            pass
-    finally:
-        db.close()
-
-
-async def _groq_match(resume_text: str, jd_text: str) -> dict:
-    """Call Groq LLM to match a resume against a JD.  Returns a dict."""
-    from groq import AsyncGroq
-
-    client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-
-    system_prompt = """\
-You are a strict resume-to-job-description matcher.
-Analyse the resume carefully against the job description based on ACTUAL skills present.
-
-RULES:
-- Only give a high match % if the resume ACTUALLY has the required skills.
-- A non-tech or irrelevant resume should score 10-30%.
-- Be honest — do NOT give everyone 70%+.
-- Return ONLY valid JSON, no markdown, no backticks.
-
-Required format:
-{
-  "match_pct": 75,
-  "matching_skills": ["Python", "SQL"],
-  "missing_skills": ["Docker", "Kubernetes"],
-  "advice": "One specific, actionable sentence about this match."
-}"""
-
-    user_msg = (
-        f"Resume:\n{resume_text[:1500]}\n\n"
-        f"Job Description:\n{jd_text[:1500]}\n\n"
-        "Analyse and return the JSON result."
-    )
-
-    for attempt in range(3):
-        try:
-            resp = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=settings.GROQ_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_msg},
-                    ],
-                    max_tokens=400,
-                    temperature=0.2,
-                ),
-                timeout=22.0,
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            parsed = json.loads(raw)
-            # Clamp match_pct to 0-100
-            parsed["match_pct"] = max(0, min(100, int(parsed.get("match_pct", 0))))
-            return parsed
-
-        except asyncio.TimeoutError:
-            print(f"⏱️  Groq JD match timeout (attempt {attempt + 1})")
-        except json.JSONDecodeError as e:
-            print(f"⚠️  Groq JD match JSON parse failed (attempt {attempt + 1}): {e}")
-        except Exception as e:
-            print(f"⚠️  Groq JD match error (attempt {attempt + 1}): {e}")
-
-        if attempt < 2:
-            await asyncio.sleep(2)
-
-    # Keyword fallback so the card doesn't stay stuck at 0%
-    return {
-        "match_pct": 0,
-        "matching_skills": [],
-        "missing_skills": [],
-        "advice": "Could not analyse match automatically. Try uploading your resume and retrying.",
-    }
-
-
-# ── Utility ───────────────────────────────────────────────────────────────────
-
-def _safe_json(value: str | None) -> list:
-    try:
-        return json.loads(value) if value else []
-    except Exception:
+        parsed = json.loads(value) if value else []
+    except (json.JSONDecodeError, TypeError):
         return []
+    return parsed if isinstance(parsed, list) else []
+
+
+@router.post("/submit", response_model=StudentJDOut, status_code=201)
+async def submit_jd(
+    body: SubmitJDRequest, request: Request, principal: CurrentUser, db: DbSession
+) -> StudentJDOut:
+    """Save a pasted JD for the authenticated student and queue the resume match."""
+    await ratelimit.limit_by_user(principal.id, "jd_submit", "20/3600")
+
+    row = StudentJD(
+        student_id=principal.id,
+        company_name=body.company_name,
+        role_title=body.role_title,
+        jd_text=body.jd_text,
+        status="pending",
+    )
+    db.add(row)
+    db.flush()
+
+    # Index it now so the interview has requirements to retrieve.
+    rag_service.index_jd(db, str(row.id), body.jd_text)
+
+    jobs.enqueue(
+        db,
+        kind="match_student_jd",
+        payload={"student_jd_id": str(row.id), "student_id": principal.id},
+        dedupe_key=f"match_jd:{row.id}",
+    )
+    audit.record(
+        db,
+        action="jd.submitted",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        target=audit.target_for("student_jd", str(row.id)),
+        detail={"company": body.company_name, "role": body.role_title},
+        ip=ratelimit.client_ip(request),
+    )
+    db.commit()
+    db.refresh(row)
+    return _to_out(row)
+
+
+@router.get("/mine", response_model=list[StudentJDOut])
+async def my_jds(principal: CurrentUser, db: DbSession) -> list[StudentJDOut]:
+    rows = (
+        db.query(StudentJD)
+        .filter(StudentJD.student_id == principal.id)
+        .order_by(StudentJD.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return [_to_out(r) for r in rows]
+
+
+@router.get("/{jd_id}", response_model=StudentJDOut)
+async def jd_status(
+    jd_id: str, principal: CurrentUser, db: DbSession
+) -> StudentJDOut:
+    row = _own_jd(db, jd_id, principal.id)
+    return _to_out(row)
+
+
+@router.delete("/{jd_id}", response_model=SimpleOk)
+async def delete_jd(
+    jd_id: str, principal: CurrentUser, db: DbSession
+) -> SimpleOk:
+    row = _own_jd(db, jd_id, principal.id)
+    db.delete(row)
+    db.commit()
+    return SimpleOk(ok=True, message="Removed.")
+
+
+def _own_jd(db: DbSession, jd_id: str, student_id: str) -> StudentJD:  # type: ignore[valid-type]
+    row = (
+        db.query(StudentJD)
+        .filter(StudentJD.id == jd_id, StudentJD.student_id == student_id)
+        .first()
+    )
+    if row is None:
+        # 404 rather than 403: another student's JD id should be indistinguishable
+        # from one that does not exist.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    return row
+
+
+# ── Background job ────────────────────────────────────────────────────────────
+
+
+@jobs.register("match_student_jd")
+async def _match_student_jd(db, payload: dict) -> None:  # type: ignore[no-untyped-def]
+    row = (
+        db.query(StudentJD).filter(StudentJD.id == payload["student_jd_id"]).first()
+    )
+    if row is None or row.status == "complete":
+        return
+
+    student = db.query(Student).filter(Student.id == row.student_id).first()
+    resume_text = (student.resume_text or "").strip() if student else ""
+    if not resume_text:
+        row.status = "complete"
+        row.match_pct = 0
+        row.advice = "Upload your resume first, then submit this job description again."
+        db.commit()
+        return
+
+    system = """You match a resume against one job description on the skills actually present.
+
+Be honest: a high percentage requires the resume to genuinely have the required skills.
+An irrelevant resume scores 10-30.
+
+Reply as JSON: {"match_pct": 0-100, "matching_skills": [...], "missing_skills": [...],
+"advice": "one specific, actionable sentence"}"""
+
+    user = (
+        f"RESUME:\n{resume_text[:6000]}\n\n"
+        f"JOB DESCRIPTION:\n{(row.jd_text or '')[:6000]}"
+    )
+
+    try:
+        match = await complete_structured(
+            task=Task.EXTRACTOR,
+            system=system,
+            user=user,
+            schema=_JDMatch,
+            temperature=0.2,
+            student_id=str(row.student_id),
+        )
+    except LLMError:
+        # Leave it queued: the worker retries with backoff rather than writing a 0%
+        # that looks like a real assessment.
+        raise
+
+    row.match_pct = match.match_pct
+    row.matched_skills = json.dumps(match.matching_skills)
+    row.missing_skills = json.dumps(match.missing_skills)
+    row.advice = match.advice
+    row.status = "complete"
+    db.commit()
+    log.info("student_jd_matched", jd_id=str(row.id), match_pct=match.match_pct)

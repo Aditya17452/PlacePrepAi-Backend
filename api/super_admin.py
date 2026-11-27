@@ -1,452 +1,447 @@
-"""
-api/super_admin.py — Super Admin control panel routes.
-Only accessible by the configured SUPER_ADMIN_EMAIL account.
+"""Platform admin endpoints (the role formerly called `super_admin`).
+
+URL paths stay under `/api/super/*` for frontend compatibility; the role is now `admin`.
+
+The important change is college enrolment. It used to accept a `handler_password` in the
+request and set it on the officer's account — we were choosing someone else's password and
+transmitting it through our own logs. Enrolment now creates the college and **invites**
+the college admin, who sets their own password through a one-time link.
 """
 
-import uuid
-import hashlib
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
-from sqlalchemy import text
+from __future__ import annotations
 
-from models.database import get_db, Student, InterviewSession, SessionScore, College
+from datetime import timedelta
+
+from fastapi import APIRouter, HTTPException, Request, status
+from sqlalchemy import func
+
+from api.deps import Admin, DbSession
+from core import audit, ratelimit
 from core.config import settings
-from api.auth import get_current_user
+from core.logging_setup import get_logger
+from core.roles import Role, normalize_role
+from core.security import hash_password
+from models.billing import LlmUsage, Payment
+from models.database import College, InterviewSession, Student, utcnow
+from models.identity import ApiAuditLog
+from models.schemas import (
+    AcceptInviteRequest,
+    AuditLogOut,
+    CollegeOut,
+    EnrollCollegeRequest,
+    LedgerEntryOut,
+    PlatformStatsResponse,
+    SimpleOk,
+    TokenResponse,
+)
+from models.tokens import TokenLedger, TokenLot
+from services import notify, token_service, verification
 
-router = APIRouter(prefix="/api/super", tags=["super_admin"])
+log = get_logger("admin")
 
-PLAN_CREDITS = {100: 500, 300: 1500, 600: 3000}
-
-
-# ── Guard ─────────────────────────────────────────────────────────────────────
-
-def require_super_admin(current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") != "super_admin":
-        raise HTTPException(status_code=403, detail="Super admin access required")
-    return current_user
-
-
-# ── Platform stats ────────────────────────────────────────────────────────────
-
-@router.get("/stats")
-def get_platform_stats(
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    total_students = db.query(Student).filter(Student.role == "student").count()
-    total_interviews = db.query(InterviewSession).count()
-    completed = db.query(InterviewSession).filter(
-        InterviewSession.status == "completed"
-    ).count()
-    total_colleges = db.query(College).filter(College.is_active == True).count()
-
-    try:
-        credits_data = db.execute(text(
-            "SELECT COALESCE(SUM(credits), 0), COALESCE(SUM(total_used), 0) "
-            "FROM student_credits"
-        )).fetchone()
-        total_credits = int(credits_data[0]) if credits_data else 0
-        total_used    = int(credits_data[1]) if credits_data else 0
-    except Exception:
-        total_credits = 0
-        total_used    = 0
-
-    return {
-        "total_students":          total_students,
-        "total_interviews":        total_interviews,
-        "completed_interviews":    completed,
-        "total_colleges":          total_colleges,
-        "total_credits_remaining": total_credits,
-        "total_credits_consumed":  total_used,
-    }
+router = APIRouter(prefix="/api/super", tags=["admin"])
 
 
-# ── All students ──────────────────────────────────────────────────────────────
-
-@router.get("/students")
-def get_all_students(
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    students = db.query(Student).filter(Student.role == "student").order_by(
-        Student.created_at.desc()
-    ).all()
-
-    # Build college domain map for quick lookup
-    colleges = {c.domain: c.name for c in db.query(College).all()}
-
-    result = []
-    for s in students:
-        try:
-            credits_row = db.execute(
-                text("SELECT credits, total_used FROM student_credits WHERE student_id=:sid"),
-                {"sid": str(s.id)}
-            ).fetchone()
-            credits = credits_row[0] if credits_row else 0
-            used    = credits_row[1] if credits_row else 0
-        except Exception:
-            credits = 0
-            used    = 0
-
-        interview_count = db.query(InterviewSession).filter(
-            InterviewSession.student_id == str(s.id),
-            InterviewSession.status == "completed"
-        ).count()
-
-        scores = db.query(SessionScore).join(
-            InterviewSession,
-            SessionScore.session_id == InterviewSession.id
-        ).filter(InterviewSession.student_id == str(s.id)).all()
-
-        valid_scores = [sc.overall_score for sc in scores if sc.overall_score is not None]
-        avg_score = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0
-
-        # Derive college from email domain
-        email_domain = s.email.split("@")[-1] if s.email and "@" in s.email else ""
-        college_name = colleges.get(email_domain, "")
-
-        result.append({
-            "id":                str(s.id),
-            "name":              s.name,
-            "email":             s.email,
-            "branch":            getattr(s, "branch", "") or "",
-            "cgpa":              getattr(s, "cgpa", "") or "",
-            "college":           college_name,
-            "credits_remaining": credits,
-            "credits_used":      used,
-            "total_interviews":  interview_count,
-            "avg_score":         avg_score,
-        })
-
-    return {"students": result}
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 
-# ── Credits management ────────────────────────────────────────────────────────
+@router.get("/stats", response_model=PlatformStatsResponse)
+async def platform_stats(principal: Admin, db: DbSession) -> PlatformStatsResponse:
+    total_students = (
+        db.query(func.count(Student.id)).filter(Student.role == "student").scalar() or 0
+    )
+    total_colleges = (
+        db.query(func.count(College.id))
+        .filter(College.is_active.is_(True), College.deleted_at.is_(None))
+        .scalar()
+        or 0
+    )
+    total_interviews = db.query(func.count(InterviewSession.id)).scalar() or 0
+    completed = (
+        db.query(func.count(InterviewSession.id))
+        .filter(InterviewSession.status == "completed")
+        .scalar()
+        or 0
+    )
 
-@router.post("/credits/{student_id}/add")
-def super_add_credits(
-    student_id: str,
-    body: dict,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    amount = int(body.get("amount", 5))
-    if amount <= 0:
-        raise HTTPException(400, "Amount must be positive")
-    try:
-        existing = db.execute(
-            text("SELECT id FROM student_credits WHERE student_id=:sid"),
-            {"sid": student_id}
-        ).fetchone()
-        if existing:
-            db.execute(
-                text("UPDATE student_credits SET credits = credits + :n WHERE student_id=:sid"),
-                {"n": amount, "sid": student_id}
-            )
-        else:
-            db.execute(
-                text("INSERT INTO student_credits (id, student_id, credits, total_used) "
-                     "VALUES (:id, :sid, :n, 0)"),
-                {"id": str(uuid.uuid4()), "sid": student_id, "n": amount}
-            )
-        
-        # Audit Log
-        db.execute(text("""
-            INSERT INTO credit_transactions
-            (id, student_id, amount, reason, created_by, created_at)
-            VALUES (:id, :sid, :n, 'admin_add', 'super_admin', NOW())
-        """), {"id": str(uuid.uuid4()), "sid": student_id, "n": amount})
-        
-        db.commit()
-        return {"success": True, "added": amount}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, str(e))
+    outstanding = (
+        db.query(func.coalesce(func.sum(TokenLot.remaining), 0)).scalar() or 0
+    )
+    consumed = (
+        db.query(func.coalesce(func.sum(-TokenLedger.amount), 0))
+        .filter(TokenLedger.kind == "consume")
+        .scalar()
+        or 0
+    )
+    revenue = (
+        db.query(func.coalesce(func.sum(Payment.amount_paise), 0))
+        .filter(Payment.status == "captured")
+        .scalar()
+        or 0
+    )
+
+    since = utcnow() - timedelta(days=30)
+    llm_cost = (
+        db.query(func.coalesce(func.sum(LlmUsage.cost_usd), 0.0))
+        .filter(LlmUsage.created_at >= since)
+        .scalar()
+        or 0.0
+    )
+    interviews_30d = (
+        db.query(func.count(InterviewSession.id))
+        .filter(InterviewSession.started_at >= since)
+        .scalar()
+        or 0
+    )
+
+    # The §9 guardrail: hold the Rs 10 and Rs 9 college tiers until this is under Rs 5.
+    cost_per_interview = None
+    if interviews_30d:
+        # Approximate USD->INR; refine once there is a billing feed to reconcile against.
+        cost_per_interview = round((float(llm_cost) * 84.0) / interviews_30d, 2)
+
+    return PlatformStatsResponse(
+        total_students=int(total_students),
+        total_colleges=int(total_colleges),
+        total_interviews=int(total_interviews),
+        completed_interviews=int(completed),
+        tokens_outstanding=int(outstanding),
+        tokens_consumed=int(consumed),
+        revenue_paise=int(revenue),
+        cost_per_interview_inr=cost_per_interview,
+        llm_cost_usd_30d=round(float(llm_cost), 4),
+    )
 
 
-@router.post("/credits/{student_id}/reset")
-def super_reset_credits(
-    student_id: str,
-    body: dict,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    amount = int(body.get("credits", 5))
-    try:
-        # Get existing credits to calculate diff for audit log
-        existing = db.execute(
-            text("SELECT credits FROM student_credits WHERE student_id=:sid"),
-            {"sid": student_id}
-        ).fetchone()
-        
-        db.execute(
-            text("UPDATE student_credits SET credits=:n WHERE student_id=:sid"),
-            {"n": amount, "sid": student_id}
+# ── Colleges ──────────────────────────────────────────────────────────────────
+
+
+@router.get("/colleges", response_model=list[CollegeOut])
+async def list_colleges(principal: Admin, db: DbSession) -> list[CollegeOut]:
+    colleges = (
+        db.query(College)
+        .filter(College.deleted_at.is_(None))
+        .order_by(College.name)
+        .all()
+    )
+    out: list[CollegeOut] = []
+    for college in colleges:
+        wallet = token_service.get_or_create_wallet(db, "college", str(college.id))
+        granted = (
+            db.query(func.coalesce(func.sum(TokenLot.qty), 0))
+            .filter(TokenLot.wallet_id == wallet.id)
+            .scalar()
+            or 0
         )
-        
-        # Audit Log
-        db.execute(text("""
-            INSERT INTO credit_transactions
-            (id, student_id, amount, reason, created_by, created_at)
-            VALUES (:id, :sid, :n, 'admin_reset', 'super_admin', NOW())
-        """), {"id": str(uuid.uuid4()), "sid": student_id, "n": amount})
-
-        db.commit()
-        return {"success": True, "set_to": amount}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, str(e))
-
-
-# ── Student reports ───────────────────────────────────────────────────────────
-
-@router.get("/student/{student_id}/reports")
-def get_student_reports(
-    student_id: str,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    sessions = db.query(InterviewSession).filter(
-        InterviewSession.student_id == student_id,
-        InterviewSession.status == "completed"
-    ).order_by(InterviewSession.started_at.desc()).all()
-
-    result = []
-    for s in sessions:
-        score = db.query(SessionScore).filter(
-            SessionScore.session_id == s.id
-        ).first()
-        result.append({
-            "session_id":    str(s.id),
-            "date":          s.started_at.strftime("%b %d, %Y") if s.started_at else "",
-            "overall_score": score.overall_score if score else 0,
-            "verdict":       score.verdict if score else "N/A",
-            "technical":     score.technical_score if score else 0,
-            "communication": score.communication_score if score else 0,
-        })
-
-    return {"reports": result}
-
-
-@router.get("/credit-logs")
-def get_credit_logs(
-    db: Session = Depends(get_db), 
-    _: dict = Depends(require_super_admin)
-):
-    rows = db.execute(text("""
-        SELECT ct.student_id, s.name, ct.amount, 
-               ct.reason, ct.created_at
-        FROM credit_transactions ct
-        LEFT JOIN students s ON s.id::text = ct.student_id
-        ORDER BY ct.created_at DESC
-        LIMIT 100
-    """)).fetchall()
-    return {"logs": [
-        {
-            "student_name": r[1] or r[0][:8],
-            "amount": r[2],
-            "reason": r[3],
-            "date": str(r[4])[:10]
-        } for r in rows
-    ]}
-
-
-# ── College management ────────────────────────────────────────────────────────
-
-@router.get("/colleges")
-def get_all_colleges(
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    colleges = db.query(College).order_by(College.created_at.desc()).all()
-    result = []
-    for c in colleges:
-        # Count enrolled students from this domain
-        enrolled = db.query(Student).filter(
-            Student.role == "student",
-            Student.email.like(f"%@{c.domain}")
-        ).count()
-
-        # Sum credits used by students from this college
-        try:
-            used_data = db.execute(text("""
-                SELECT COALESCE(SUM(sc.total_used), 0)
-                FROM student_credits sc
-                JOIN students s ON s.id::text = sc.student_id
-                WHERE s.email LIKE :domain AND s.role = 'student'
-            """), {"domain": f"%@{c.domain}"}).fetchone()
-            college_credits_used = int(used_data[0]) if used_data else 0
-        except Exception:
-            college_credits_used = 0
-
-        result.append({
-            "id":            str(c.id),
-            "name":          c.name,
-            "domain":        c.domain,
-            "plan":          c.plan,
-            "total_credits": c.total_credits,
-            "credits_used":  college_credits_used,
-            "credits_left":  max(0, c.total_credits - college_credits_used),
-            "handler_email": c.handler_email or "",
-            "is_active":     c.is_active,
-            "enrolled_students": enrolled,
-            "created_at":    c.created_at.strftime("%b %d, %Y") if c.created_at else "",
-        })
-    return {"colleges": result}
-
-
-@router.post("/colleges/enroll")
-def enroll_college(
-    body: dict,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    """
-    Enroll a new college/institute.
-    Creates the college record and a handler (officer) account.
-    """
-    name           = body.get("name", "").strip()
-    domain         = body.get("domain", "").strip().lower().lstrip("@")
-    plan           = int(body.get("plan", 100))
-    handler_name   = body.get("handler_name", "").strip()
-    handler_email  = body.get("handler_email", "").strip().lower()
-    handler_password = body.get("handler_password", "")
-
-    if not name or not domain or not handler_email or not handler_password:
-        raise HTTPException(400, "name, domain, handler_email and handler_password are required")
-
-    if plan not in PLAN_CREDITS:
-        raise HTTPException(400, f"plan must be one of {list(PLAN_CREDITS.keys())}")
-
-    # Check domain not already enrolled
-    existing_college = db.query(College).filter(College.domain == domain).first()
-    if existing_college:
-        raise HTTPException(409, f"Domain '{domain}' is already enrolled")
-
-    # Check handler email
-    handler = db.query(Student).filter(Student.email == handler_email).first()
-    
-    total_credits = PLAN_CREDITS[plan]
-
-    try:
-        # 1. Create or update handler (officer) account
-        if not handler:
-            handler_id = str(uuid.uuid4())
-            handler = Student(
-                id=handler_id,
-                name=handler_name or f"{name} Handler",
-                email=handler_email,
-                role="officer",
-                password_hash=hashlib.sha256(handler_password.encode()).hexdigest(),
-                branch="Administration",
-                cgpa=0.0,
+        students = (
+            db.query(func.count(Student.id))
+            .filter(Student.college_id == str(college.id))
+            .scalar()
+            or 0
+        )
+        out.append(
+            CollegeOut(
+                id=str(college.id),
+                name=college.name,
+                domain=college.domain,
+                is_active=bool(college.is_active),
+                pool_balance=int(wallet.balance),
+                pool_granted=int(granted),
+                students=int(students),
+                monthly_allowance_default=int(college.monthly_allowance_default or 4),
+                daily_interview_cap=int(college.daily_interview_cap or 3),
+                distribution_frozen=bool(college.distribution_frozen),
             )
-            db.add(handler)
-        else:
-            handler.role = "officer"
-            if handler_password:
-                handler.password_hash = hashlib.sha256(handler_password.encode()).hexdigest()
-            handler_id = handler.id
-            
-        db.flush() # flush to get handler inserted/updated in transaction
+        )
+    db.commit()
+    return out
 
-        # 2. Create college record
-        college = College(
-            id=str(uuid.uuid4()),
-            name=name,
-            domain=domain,
-            plan=plan,
-            total_credits=total_credits,
-            credits_used=0,
-            handler_email=handler_email,
-            handler_id=handler_id,
-            credit_limit=5,
+
+@router.post("/colleges/enroll", response_model=SimpleOk, status_code=201)
+async def enroll_college(
+    body: EnrollCollegeRequest, request: Request, principal: Admin, db: DbSession
+) -> SimpleOk:
+    """Create a college and invite its admin.
+
+    No tokens are granted here — that is a separate, audited action with a reason
+    (`POST /api/admin/tokens/grant`), so a pool can never appear without a record of who
+    created it and why.
+    """
+    admin_email = body.admin_email.strip().lower()
+    domain = body.domain.strip().lower().lstrip("@") if body.domain else None
+
+    if domain:
+        clash = db.query(College).filter(College.domain == domain).first()
+        if clash is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"Domain '{domain}' is already in use."
+            )
+
+    college = College(
+        name=body.name.strip(),
+        # Stored but NOT verified: a domain only enrolls students once an admin has
+        # confirmed the college owns it (PLAN.md §7.3).
+        domain=domain,
+        domain_verified_at=None,
+        monthly_allowance_default=body.monthly_allowance_default,
+        daily_interview_cap=body.daily_interview_cap,
+        is_active=True,
+    )
+    db.add(college)
+    db.flush()
+    token_service.get_or_create_wallet(db, "college", str(college.id))
+
+    account = db.query(Student).filter(Student.email == admin_email).first()
+    if account is None:
+        account = Student(
+            name=body.admin_name.strip(),
+            email=admin_email,
+            role=Role.COLLEGE_ADMIN.value,
+            # No password is set by us. The invite link lets them choose one.
+            password_hash=None,
+            password_algo="invite_pending",
+            branch="Administration",
+            cgpa=0.0,
+            college_id=str(college.id),
             is_active=True,
+            enrolled_via="direct",
         )
-        db.add(college)
+        db.add(account)
+        db.flush()
+    else:
+        account.role = Role.COLLEGE_ADMIN.value
+        account.college_id = str(college.id)
+        account.token_version = int(getattr(account, "token_version", 0) or 0) + 1
 
-        # 3. Give handler minimal credits (they don't interview themselves)
-        db.execute(text(
-            "INSERT INTO student_credits (id, student_id, credits, total_used) VALUES (:id, :sid, 0, 0)"
-        ), {"id": str(uuid.uuid4()), "sid": handler_id})
+    college.handler_email = admin_email
+    college.handler_id = str(account.id)
 
-        db.commit()
-
-        return {
-            "success":       True,
-            "college_id":    str(college.id),
-            "handler_id":    handler_id,
-            "plan":          plan,
-            "total_credits": total_credits,
-            "message":       f"College '{name}' enrolled. Handler account created for {handler_email}",
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, str(e))
-
-
-@router.post("/colleges/{college_id}/deactivate")
-def deactivate_college(
-    college_id: str,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    college = db.query(College).filter(College.id == college_id).first()
-    if not college:
-        raise HTTPException(404, "College not found")
-    
-    db.execute(
-        text("UPDATE colleges SET is_active=false WHERE id=:id"),
-        {"id": college_id}
+    invite = verification.issue(
+        db,
+        purpose="admin_invite",
+        subject=admin_email,
+        student_id=str(account.id),
+        ttl_sec=7 * 24 * 3600,
+        numeric=False,
+        request_ip=ratelimit.client_ip(request),
+    )
+    audit.record(
+        db,
+        action="admin.college_enrolled",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        target=audit.target_for("college", str(college.id)),
+        detail={"name": college.name, "admin_email": admin_email, "domain": domain},
+        ip=ratelimit.client_ip(request),
     )
     db.commit()
-    return {"success": True, "message": f"College '{college.name}' deactivated"}
+
+    try:
+        await notify.send_email_code(
+            to=admin_email, code=invite.code, purpose="admin_invite"
+        )
+        delivered = True
+    except notify.NotificationUnavailable as exc:
+        log.error("invite_not_delivered", error=str(exc)[:160])
+        delivered = False
+
+    message = f"College '{college.name}' created and {admin_email} invited."
+    if not delivered:
+        message += (
+            " The invite email could not be sent — no email provider is configured yet."
+        )
+    return SimpleOk(ok=True, message=message)
 
 
-@router.get("/colleges/{college_id}/students")
-def get_college_students(
-    college_id: str,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_super_admin)
-):
-    """Get all students for a specific college."""
+@router.post("/colleges/{college_id}/deactivate", response_model=SimpleOk)
+async def deactivate_college(
+    college_id: str, request: Request, principal: Admin, db: DbSession
+) -> SimpleOk:
+    """Soft-delete. Hard deletion is a separate purge job after the retention period."""
     college = db.query(College).filter(College.id == college_id).first()
-    if not college:
-        raise HTTPException(404, "College not found")
+    if college is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "College not found")
 
-    students = db.query(Student).filter(
-        Student.role == "student",
-        Student.email.like(f"%@{college.domain}")
-    ).all()
+    college.is_active = False
+    audit.record(
+        db,
+        action="admin.college_deactivated",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        target=audit.target_for("college", college_id),
+        detail={"name": college.name},
+        ip=ratelimit.client_ip(request),
+    )
+    db.commit()
+    return SimpleOk(ok=True, message=f"{college.name} deactivated.")
 
-    result = []
-    for s in students:
-        try:
-            cr = db.execute(
-                text("SELECT credits, total_used FROM student_credits WHERE student_id=:sid"),
-                {"sid": str(s.id)}
-            ).fetchone()
-            credits = cr[0] if cr else 0
-            used    = cr[1] if cr else 0
-        except Exception:
-            credits = 0
-            used    = 0
 
-        interview_count = db.query(InterviewSession).filter(
-            InterviewSession.student_id == str(s.id),
-            InterviewSession.status == "completed"
-        ).count()
+@router.post("/colleges/{college_id}/verify-domain", response_model=SimpleOk)
+async def verify_domain(
+    college_id: str, request: Request, principal: Admin, db: DbSession
+) -> SimpleOk:
+    """Mark a college's domain as verified, enabling domain-based enrolment.
 
-        result.append({
-            "id":                str(s.id),
-            "name":              s.name,
-            "email":             s.email,
-            "branch":            s.branch or "",
-            "cgpa":              s.cgpa or 0,
-            "credits_remaining": credits,
-            "credits_used":      used,
-            "total_interviews":  interview_count,
-        })
+    Deliberately a manual admin action: the check is a DNS TXT record or written
+    confirmation from the college, done out of band. Students can never self-add a domain,
+    which is what stops a lookalike like `indoreinstitute-edu.com`.
+    """
+    college = db.query(College).filter(College.id == college_id).first()
+    if college is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "College not found")
+    if not college.domain:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "This college has no domain configured."
+        )
 
-    return {"college": college.name, "domain": college.domain, "students": result}
+    college.domain_verified_at = utcnow()
+    audit.record(
+        db,
+        action="admin.domain_verified",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        target=audit.target_for("college", college_id),
+        detail={"domain": college.domain},
+        ip=ratelimit.client_ip(request),
+    )
+    db.commit()
+    return SimpleOk(ok=True, message=f"{college.domain} marked verified.")
+
+
+@router.post("/colleges/{college_id}/freeze", response_model=SimpleOk)
+async def freeze_distribution(
+    college_id: str, frozen: bool, principal: Admin, db: DbSession
+) -> SimpleOk:
+    college = db.query(College).filter(College.id == college_id).first()
+    if college is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "College not found")
+    college.distribution_frozen = frozen
+    audit.record(
+        db,
+        action="admin.distribution_frozen" if frozen else "admin.distribution_unfrozen",
+        actor_id=principal.id,
+        actor_role=principal.role.value,
+        target=audit.target_for("college", college_id),
+    )
+    db.commit()
+    return SimpleOk(ok=True)
+
+
+# ── Invites ───────────────────────────────────────────────────────────────────
+
+
+@router.post("/invite/accept", response_model=TokenResponse)
+async def accept_invite(
+    body: AcceptInviteRequest, request: Request, db: DbSession
+) -> TokenResponse:
+    """A college admin sets their own password from the invite link."""
+    await ratelimit.limit_auth(request)
+    try:
+        row = verification.consume_token(db, purpose="admin_invite", code=body.code)
+    except verification.VerificationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    account = db.query(Student).filter(Student.id == row.student_id).first()
+    if account is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+
+    account.password_hash = hash_password(body.password)
+    account.password_algo = "bcrypt"
+    account.email_verified_at = account.email_verified_at or utcnow()
+    account.token_version = int(getattr(account, "token_version", 0) or 0) + 1
+
+    audit.record(
+        db,
+        action="admin.invite_accepted",
+        actor_id=str(account.id),
+        actor_role=normalize_role(account.role).value,
+        ip=ratelimit.client_ip(request),
+    )
+    db.commit()
+    db.refresh(account)
+
+    from core.security import make_access_token
+
+    return TokenResponse(
+        token=make_access_token(
+            str(account.id), int(getattr(account, "token_version", 0) or 0)
+        ),
+        role=normalize_role(account.role).value,  # type: ignore[arg-type]
+        name=account.name or "",
+        id=str(account.id),
+    )
+
+
+# ── Audit & ledger ────────────────────────────────────────────────────────────
+
+
+@router.get("/audit-log", response_model=list[AuditLogOut])
+async def audit_log(
+    principal: Admin, db: DbSession, limit: int = 100
+) -> list[AuditLogOut]:
+    rows = (
+        db.query(ApiAuditLog)
+        .order_by(ApiAuditLog.created_at.desc())
+        .limit(min(max(limit, 1), 500))
+        .all()
+    )
+    return [AuditLogOut.model_validate(r) for r in rows]
+
+
+@router.get("/credit-logs", response_model=list[LedgerEntryOut])
+async def token_ledger(
+    principal: Admin, db: DbSession, limit: int = 100
+) -> list[LedgerEntryOut]:
+    """Every token movement, newest first. Kept at the old path for the admin panel."""
+    rows = (
+        db.query(TokenLedger)
+        .order_by(TokenLedger.created_at.desc())
+        .limit(min(max(limit, 1), 500))
+        .all()
+    )
+    return [LedgerEntryOut.model_validate(r) for r in rows]
+
+
+# ── Maintenance (called by cron) ──────────────────────────────────────────────
+
+
+@router.post("/jobs/drain", response_model=dict, include_in_schema=False)
+async def drain_jobs(principal: Admin, db: DbSession, limit: int = 5) -> dict:
+    """Run queued background jobs.
+
+    Exposed to admins as well as cron so a stuck queue can be nudged by hand instead of
+    waiting for the next scheduled run.
+    """
+    from services import jobs
+
+    jobs.requeue_stale(db)
+    result = await jobs.drain(db, limit=limit)
+    return result
+
+
+@router.get("/config-check", response_model=dict)
+async def config_check(principal: Admin) -> dict:
+    """What is and is not configured, for the launch checklist.
+
+    Reports presence only — never a secret's value.
+    """
+    return {
+        "env": settings.ENV,
+        "database": bool(settings.DATABASE_URL),
+        "redis": settings.redis_configured,
+        "groq": bool(settings.GROQ_API_KEY),
+        "groq_fallback_key": bool(settings.GROQ_API_KEY2),
+        "question_model": settings.LLM_MODEL_QUESTION,
+        "stt_model": settings.STT_MODEL,
+        "google_oauth": bool(settings.GOOGLE_CLIENT_ID),
+        "razorpay": bool(settings.RAZORPAY_KEY_ID),
+        "razorpay_webhook": bool(settings.RAZORPAY_WEBHOOK_SECRET),
+        "razorpay_mode": "test"
+        if settings.RAZORPAY_KEY_ID.startswith("rzp_test_")
+        else ("live" if settings.RAZORPAY_KEY_ID else "unset"),
+        "supabase_storage": bool(settings.SUPABASE_SERVICE_ROLE_KEY),
+        "github_token": bool(settings.GITHUB_TOKEN),
+        "email_provider": bool(settings.RESEND_API_KEY),
+        "sms_provider": bool(settings.SMS_API_KEY),
+        "sentry": bool(settings.SENTRY_DSN),
+    }
