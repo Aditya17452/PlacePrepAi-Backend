@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type-check
+        # Not gating the build yet: the codebase is mid-migration to full annotations.
+        # Remove `|| true` once it is clean.
+        run: mypy --ignore-missing-imports core services api models agents || true
+
+      - name: Tests
+        env:
+          ENV: local
+          # Test-only values. Real secrets live in the Vercel project, never in CI.
+          JWT_SECRET: ci-secret-that-is-at-least-32-characters-long
+          DATABASE_URL: sqlite:///./ci.db
+          CORS_ORIGINS: http://localhost:8080
+          RAZORPAY_WEBHOOK_SECRET: webhook-test-secret
+          BCRYPT_ROUNDS: "4"
+        run: pytest -q
+
+      - name: Check migrations render
+        env:
+          DATABASE_URL: postgresql://user:pass@localhost:5432/placeprep
+        # Catches a migration that does not even compile, without needing a database.
+        # 0003 moves data and refuses offline mode, so only the schema steps are rendered.
+        run: alembic upgrade 0002_phase1_foundation --sql > /dev/null
+
+      - name: Fail if a secret-looking value was committed
+        run: |
+          if git grep -nE 'rzp_(test|live)_[A-Za-z0-9]{10,}|gsk_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}' -- . ':!*.yml' ':!*.md'; then
+            echo "::error::A credential-shaped string is committed. Move it to an env var."
+            exit 1
+          fi
