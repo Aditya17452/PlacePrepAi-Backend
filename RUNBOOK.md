@@ -120,7 +120,7 @@ alembic stamp 0001_baseline
 # 3. Apply:
 alembic upgrade head
 # 4. Verify:
-alembic current          # expect 0004_rls_deny_by_default
+alembic current          # expect 0006_fk_covering_indexes
 # 5. Seed plans, JD templates and the retrieval chunks:
 python -m scripts.seed
 ```
@@ -142,6 +142,35 @@ Notes:
 
 After applying, re-run the Supabase security and performance advisors and expect the
 `rls_disabled_in_public` findings to be gone.
+
+**Two advisor findings are expected to remain, and must not be "fixed":**
+
+- `rls_enabled_no_policy` (INFO, 32 tables). This *is* the intended state: RLS on with
+  no policies means deny-by-default for `anon` and `authenticated`. The advisor flags it
+  because the usual cause is someone enabling RLS and forgetting policies, locking their
+  own client app out. Here there is no client app on that path. **Adding policies to
+  silence this would grant the anon key access and undo the fix.**
+- `unused_index` (INFO). Immediately after a migration this only means no traffic has
+  reached the new tables yet. Re-check after a real end-to-end run before considering any
+  index for removal.
+
+### State of the live database (applied 2026-11-27)
+
+| | |
+|---|---|
+| `alembic_version` | `0006_fk_covering_indexes` |
+| Student wallets | 8, totalling 472 tokens |
+| College pool | 1 wallet, 457 tokens, expires in 365 days |
+| Students linked to a college | 7 (2 platform admins deliberately unscoped) |
+| Default allowance group | 1, with 6 student members at 4/month |
+| `jd_chunks` | 6 — one per seeded role, so JD retrieval returns requirements again |
+| `plans` | 7 |
+| RLS | 32 tables enabled, 0 policies, 0 `anon` / `authenticated` grants |
+
+One `student_credits` row holding 3 credits was **not** migrated: its `student_id` has no
+matching row in `students`. The Alembic migration joins to `students` and skips it too, so
+472 rather than 475 is the correct, faithful result. Nothing to chase unless that account
+is meant to exist.
 
 Rollback: `alembic downgrade 0001_baseline` undoes `0002`, `0003` and `0004`.
 `0001` refuses to downgrade on purpose — it would drop every interview on the platform.
