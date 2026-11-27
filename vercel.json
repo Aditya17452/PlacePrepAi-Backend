@@ -9,15 +9,7 @@
   ],
   "rewrites": [{ "source": "/(.*)", "destination": "/api/index.py" }],
   "crons": [
-    {
-      "comment": "Keeps a Free-tier Supabase project from pausing after a week idle, which would look like an outage mid-interview.",
-      "path": "/api/cron/keepalive",
-      "schedule": "0 6 * * *"
-    },
-    {
-      "comment": "Drains the job queue (evaluations, JD matches), expires token lots, purges 14-day-old proctoring snapshots. Vercel Hobby allows 2 crons at daily frequency, so this slot does all the periodic work. On Pro, split drain-jobs back out at */5 and leave maintenance daily.",
-      "path": "/api/cron/maintenance",
-      "schedule": "17 3 * * *"
-    }
+    { "path": "/api/cron/keepalive", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/maintenance", "schedule": "17 3 * * *" }
   ]
 }

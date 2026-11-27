@@ -336,3 +336,31 @@ change and a redeploy — no code change, nothing to rebuild.
 
 Nothing in that table touches application code. If an upgrade ever seems to need a code
 change, that is a bug in how the value is wired, not a plan limitation.
+
+### What the two cron jobs are for
+
+`vercel.json` is strict JSON and rejects unknown properties, so the reasoning lives here
+rather than beside the schedules.
+
+| Path | Schedule | Why |
+|---|---|---|
+| `/api/cron/keepalive` | `0 6 * * *` | Reads from Postgres and pings Redis so a Free-tier Supabase project does not pause after ~7 days idle. An auto-paused project looks exactly like an outage to a student mid-interview. It does real work on purpose: a 200 that never reached Postgres would keep the cron green while the project paused anyway. |
+| `/api/cron/maintenance` | `17 3 * * *` | Drains the job queue (evaluations, JD matches), expires token lots, purges proctoring snapshots past 14 days. |
+
+**Vercel Hobby allows two cron jobs per project, firing once a day.** Both slots are
+taken, which is why `maintenance` does all the periodic work instead of `drain-jobs`
+having its own slot — and why a pending report drains its own evaluation inline
+(`OPPORTUNISTIC_DRAIN=true`), rather than waiting up to 24 hours for the next run.
+
+On Vercel Pro, add a third entry and reduce the inline work:
+
+```json
+{ "path": "/api/cron/drain-jobs", "schedule": "*/5 * * * *" }
+```
+
+then set `CRON_DRAIN_BATCH=5` and `OPPORTUNISTIC_DRAIN=false`.
+
+Both endpoints require `Authorization: Bearer $CRON_SECRET`. Vercel sends that header
+automatically when `CRON_SECRET` is set as a project environment variable. Without it the
+endpoints return 503 and refuse to run — failing closed, because an unauthenticated
+maintenance endpoint is worse than no cron.
