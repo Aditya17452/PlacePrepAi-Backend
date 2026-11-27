@@ -23,3 +23,5 @@ env/
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+# Database dumps taken before migrations (see RUNBOOK.md).
+backups/

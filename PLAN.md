@@ -422,6 +422,64 @@ ends with: what changed / how to test it / open risks.
 - Sentry on both sides (DSN via env, PII scrubbed); security headers in `vercel.json`.
 - Real tests: API client, env resolution, the reducer logic pulled out of `InterviewRoom`.
 
+> **Status (2026-11-27, branch `feat/phase1c-frontend`): done, pending end-to-end test on a Vercel preview.**
+> - [x] `src/lib/env.ts` (fails fast in production); WebSocket env vars removed — the interview is HTTP turns now.
+> - [x] Typed client generated from the backend OpenAPI schema (`npm run gen:api`), `ApiError` with status, 401 → re-login.
+> - [x] `ErrorBoundary`, `QueryClientProvider`, toasters mounted; route-level code splitting.
+> - [x] `RequireAuth` with roles `student` / `college_admin` / `admin`; old `/officer`, `/super-admin`, `/buy-credits` redirect.
+> - [x] OAuth one-time-code exchange; email/phone OTP page; college-admin invite page; MFA code on login.
+> - [x] Interview room on `POST /interviews/{id}/turns`: client `turn_id`, retry with backoff, resume after refresh, retry button.
+> - [x] Proctoring batched to `POST /interviews/{id}/proctoring` every 5 s; server decides termination; no client auto-end.
+> - [x] Tokens: wallet, plans, Razorpay checkout, status polling (webhook grants tokens); no client-side deduction.
+> - [x] College-admin console (students + reports, roster CSV, join requests, allowance groups/overrides) and admin console (colleges, grant/revoke, freeze, verify domain, audit + ledger).
+> - [x] Sentry (lazy, no PII), security headers in `vercel.json`, CI (lint, typecheck, tests, build, secret grep).
+> - [x] Tests: API client, retry, session, CSV parser, proctoring batching.
+> - [x] Shortlist UI — `/college → Shortlist`, role picker plus ranked table with integrity
+>       in its own column.
+> - [x] Server-side record of the proctoring consent — `POST /api/consents` stores kind,
+>       version, IP and user agent; `/interviews/start` refuses a proctored session without
+>       a current one.
+>       Fixing this exposed an ordering bug: the notice was on `/pre-interview` but
+>       `/interviews/start` ran one screen earlier on the dashboard, so the first interview
+>       would have 403'd before the student ever saw the consent text. The session is now
+>       created on `/pre-interview`, after they agree — which also stops a token being
+>       reserved for someone who backs out of the checklist.
+>
+> **Phase 1 gaps closed (2026-11-27, branch `feat/phase1-backend-gaps`):**
+> - [x] Consent endpoints, versioned, with the start gate. 20 tests.
+> - [x] OTP delivery: Resend for email; MSG91 for SMS behind `SMS_ENABLED=false` until the
+>       DLT template is approved. Both still return 503 when a channel is unavailable, and
+>       the message says whether it is switched off or misconfigured.
+> - [x] TOTP enrolment for admins (`/api/auth/mfa/setup` + `/confirm`), with the enrolment
+>       section on `/admin → Security`. Confirming signs the account out everywhere.
+> - [x] Confirmed **with tests**, not assertions: CORS reflects only configured origins and
+>       never `*`; rate limits on login / OTP / interview start / payments return 429 with
+>       `Retry-After`; `/ready` reports the in-memory Redis fallback honestly; resume upload
+>       refuses >5 MB (413) and non-document bytes (400) regardless of declared content type.
+> - [x] RLS deny-by-default migration `0004` — 32 tables, no policies, `anon` /
+>       `authenticated` grants revoked. Not yet applied to Supabase.
+> - [x] Backup procedure written into `RUNBOOK.md` (dashboard check + session-pooler
+>       `pg_dump` + a verification step, because a truncated dump looks like a backup).
+> - [ ] Migrations applied to Supabase and advisors re-run — **waiting on the backup**.
+> - [ ] End-to-end run on Vercel previews.
+>
+> **Contract audit against backend `chore/project-structure` (2026-11-27): no mismatches.**
+> Checked mechanically, not by eye — the committed `src/lib/api/openapi.json` was diffed
+> against the live spec from `create_app().openapi()`:
+> - 53 paths on each side, identical sets; no method differences on any shared path.
+> - `components.schemas` identical: no field-name, extra-field or `required` differences.
+> - Declared response status codes identical on every operation.
+> - Every hand-written path in `src/services/api.ts` resolves to a real route.
+> - The three query-parameter endpoints (`/officer/shortlist?jd_id`,
+>   `/super/colleges/{id}/freeze?frozen`, `/officer/enrollment-requests/{id}?approve`)
+>   are called with `query:`, not a JSON body — which is what the old `generateShortlist`
+>   got wrong and 422'd on.
+> - `withRetry` treats 503 as retryable, and is applied only to turn submission, where
+>   503 means `LLMBusy` backpressure. The other 503 paths (OTP with no provider,
+>   Razorpay unset) are permanent and are not retried.
+>
+> Nothing to fix here. The two unchecked boxes above are backend gaps, not mismatches.
+
 **1d. Load test**
 - k6: 100 concurrent WS interview sessions, ~12 turns each, Groq stubbed and live.
 - Expected bottleneck: Groq tokens/min and requests/min on the shared key. Mitigation —

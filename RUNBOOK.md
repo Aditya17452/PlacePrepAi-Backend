@@ -26,21 +26,103 @@ Tests: `pytest -q`. Lint: `ruff check .`
 
 ---
 
+## Backing up before a migration
+
+Project `nybywdmmlzgzncvrstoa` (region `ap-southeast-1`) holds real data: 9 users,
+67 interview sessions, 173 transcripts, 83 credit transactions. Do **both** steps —
+the dashboard backup is the fast restore path, the dump is the one that works if the
+project itself is unavailable.
+
+### 1. Confirm the dashboard backup
+
+Supabase Dashboard → Project → **Database → Backups**.
+
+- Check there is a backup dated **today**. Note its timestamp; that is the point you can
+  restore to.
+- On Free tier, daily backups are the only option and there is no on-demand button — the
+  `pg_dump` in step 2 is then your *only* pre-migration snapshot, so do not skip it.
+- On Pro and above, also check whether Point-in-Time Recovery is on. If it is, note the
+  current time instead; PITR can restore to the second.
+
+### 2. Take your own dump
+
+`pg_dump` needs a **session**-mode connection. The transaction pooler on port 6543
+multiplexes statements across backends and will fail or produce an inconsistent dump.
+
+Copy the **Session pooler** URI from Dashboard → Project Settings → **Database** →
+Connection string → URI (it looks like
+`postgresql://postgres.nybywdmmlzgzncvrstoa:[YOUR-PASSWORD]@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres`).
+Port **5432**, not 6543.
+
+```powershell
+# Paste the Session pooler URI, with your real database password.
+# Prompted, so the password does not land in your shell history.
+$env:PGPASSWORD = Read-Host -AsSecureString "DB password" | ForEach-Object { [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($_)) }
+```
+
+```powershell
+pg_dump --format=custom --no-owner --no-privileges --verbose --schema=public --file="D:\PlacePrep Ai Updated\backups\placeprep-pre-phase1-$(Get-Date -Format yyyyMMdd-HHmm).dump" --host=aws-0-ap-southeast-1.pooler.supabase.com --port=5432 --username=postgres.nybywdmmlzgzncvrstoa --dbname=postgres
+```
+
+Also take a plain-SQL copy — it is readable, greppable, and restorable with `psql` if
+`pg_restore` versions ever disagree:
+
+```powershell
+pg_dump --format=plain --no-owner --no-privileges --schema=public --file="D:\PlacePrep Ai Updated\backups\placeprep-pre-phase1-$(Get-Date -Format yyyyMMdd-HHmm).sql" --host=aws-0-ap-southeast-1.pooler.supabase.com --port=5432 --username=postgres.nybywdmmlzgzncvrstoa --dbname=postgres
+```
+
+### 3. Verify the dump is real before trusting it
+
+A zero-byte or truncated dump is worse than none, because it looks like a backup.
+
+```powershell
+Get-ChildItem "D:\PlacePrep Ai Updated\backups\" | Select-Object Name, Length, LastWriteTime
+```
+
+```powershell
+pg_restore --list "D:\PlacePrep Ai Updated\backups\<your-file>.dump" | Select-String "TABLE DATA" | Measure-Object
+```
+
+Expect roughly 32 `TABLE DATA` entries. Then confirm the rows that matter are in there:
+
+```powershell
+Select-String -Path "D:\PlacePrep Ai Updated\backups\<your-file>.sql" -Pattern "COPY public.(students|interview_sessions|session_transcripts|credit_transactions)" | Select-Object Line
+```
+
+Finally, clear the password from the session:
+
+```powershell
+Remove-Item Env:PGPASSWORD
+```
+
+`backups/` is gitignored. Keep a copy somewhere other than this laptop.
+
+### Restoring
+
+```powershell
+pg_restore --clean --if-exists --no-owner --no-privileges --dbname="<session pooler URI>" "D:\PlacePrep Ai Updated\backups\<your-file>.dump"
+```
+
+`--clean` drops the existing objects first. On the live project that is destructive, so
+only do it on a deliberate decision to roll the database back.
+
+---
+
 ## Applying migrations
 
-**Always snapshot first.** The project holds real data: 9 users, 67 interview sessions,
-173 transcripts, 83 credit transactions.
+**Do the backup above first.** The steps below change live data.
 
 ```bash
-# 1. Snapshot in the Supabase dashboard (Database → Backups), note the time.
-# 2. Review what will run:
+# 1. Review what will run (0004 renders only as part of a range, see note):
 alembic upgrade 0002_phase1_foundation --sql | less
-# 3. The existing schema was never migrated, so record it as the baseline:
+# 2. The existing schema was never migrated, so record it as the baseline:
 alembic stamp 0001_baseline
-# 4. Apply:
+# 3. Apply:
 alembic upgrade head
-# 5. Verify:
-alembic current          # expect 0003_backfill_tokens
+# 4. Verify:
+alembic current          # expect 0004_rls_deny_by_default
+# 5. Seed plans, JD templates and the retrieval chunks:
+python -m scripts.seed
 ```
 
 Notes:
@@ -49,12 +131,32 @@ Notes:
   a fresh environment can be built from migrations.
 - `0002` is additive except `student_credits.updated_at` TEXT → TIMESTAMP (approved).
 - `0003` moves data (credits → token ledger) and refuses `--sql` mode; it needs a live
-  connection.
+  connection. To render later migrations as SQL, use a range:
+  `alembic upgrade 0003_backfill_tokens:0004_rls_deny_by_default --sql`.
+- `0004` enables RLS with **no policies** on all 32 public tables and revokes the
+  `anon` / `authenticated` grants. It deliberately does not use
+  `FORCE ROW LEVEL SECURITY`: the backend connects as the table owner, and forcing it
+  with no policies would deny the application everything.
 - `student_credits` and `credit_transactions` are **kept** as the historical record.
   Nothing reads them after `0003`.
 
-Rollback: `alembic downgrade 0001_baseline` undoes `0002` and `0003`.
+After applying, re-run the Supabase security and performance advisors and expect the
+`rls_disabled_in_public` findings to be gone.
+
+Rollback: `alembic downgrade 0001_baseline` undoes `0002`, `0003` and `0004`.
 `0001` refuses to downgrade on purpose — it would drop every interview on the platform.
+
+### Lost authenticator (admin TOTP)
+
+There is no self-service reset, by design. Another admin clears the factor directly:
+
+```sql
+UPDATE students SET mfa_enabled = false, mfa_secret = NULL, token_version = token_version + 1
+WHERE email = '<locked-out admin>';
+```
+
+Bumping `token_version` signs that account out everywhere, so they must sign in again and
+re-enrol at `/admin → Security`.
 
 ---
 
