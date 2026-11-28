@@ -14,7 +14,7 @@ cp .env.example .env                                 # then fill it in
 python -c "import secrets; print(secrets.token_urlsafe(48))"   # JWT_SECRET
 alembic upgrade head
 python -m scripts.seed
-uvicorn main:app --reload --port 8000
+uvicorn app.main:app --reload --port 8000
 ```
 
 `http://localhost:8000/docs` has the interactive API (disabled in production).
@@ -144,7 +144,7 @@ logs `ratelimit_backend_unavailable`.
 - **OTP delivery.** No email or SMS provider is wired up. Locally the code goes to the
   log; in production the endpoint returns 503 rather than claiming it sent something.
   Pick a provider (Resend for email; MSG91 / Gupshup / Twilio for SMS, which needs Indian
-  DLT template registration) and complete `services/notify.py`.
+  DLT template registration) and complete `app/services/notify.py` and `app/integrations/{email,sms}.py`.
 - **TOTP enrolment.** Verification works and admins without it are flagged in the logs,
   but there is no enrolment endpoint yet.
 - **Frontend.** Still calls the old WebSocket and credit endpoints. The backend contract

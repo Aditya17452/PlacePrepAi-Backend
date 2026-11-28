@@ -32,7 +32,7 @@ jobs:
       - name: Type-check
         # Not gating the build yet: the codebase is mid-migration to full annotations.
         # Remove `|| true` once it is clean.
-        run: mypy --ignore-missing-imports core services api models agents || true
+        run: mypy --ignore-missing-imports app || true
 
       - name: Tests
         env:
