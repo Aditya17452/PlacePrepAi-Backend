@@ -77,7 +77,9 @@ class TopicScore(BaseModel):
 class Evaluation(BaseModel):
     technical_score: float = Field(ge=0, le=100)
     communication_score: float = Field(ge=0, le=100)
-    body_language_score: float = Field(ge=0, le=100)
+    #: None when no webcam samples were recorded. Absent data is not a zero: scoring it
+    #: 0 dragged the overall score down for students whose camera produced no samples.
+    body_language_score: float | None = Field(default=None, ge=0, le=100)
     overall_score: float = Field(ge=0, le=100)
     verdict: str = Field(pattern="^(Excellent|Good|Needs Work|Poor)$")
     topics: list[TopicScore] = Field(min_length=1, max_length=8)
@@ -357,7 +359,11 @@ async def evaluate_transcript(
         f"Eye contact {vision['avg_eye_contact']}%, posture {vision['avg_posture']}% "
         f"across {int(vision['samples'])} samples."
         if vision.get("samples")
-        else "No webcam data was recorded; score body language as 0 and say so."
+        else (
+            "No webcam data was recorded for this session. Do not score body language: "
+            "omit body_language_score from your reply, leave it out of the overall "
+            "score, and do not list body language as a weakness."
+        )
     )
 
     system = """You are a senior engineer and hiring manager grading a mock interview.
@@ -372,7 +378,8 @@ Answers were captured by speech-to-text: forgive homophones and mis-transcribed 
 terms and grade the intended meaning.
 
 Reply as JSON only, with these keys: technical_score, communication_score, \
-body_language_score, overall_score (all 0-100), verdict (exactly one of "Excellent", \
+overall_score (all 0-100), body_language_score (0-100, omit it entirely when the note \
+below says no webcam data was recorded), verdict (exactly one of "Excellent", \
 "Good", "Needs Work", "Poor"), topics (3-5 objects with name, score, feedback), \
 strengths (3), improvements (3), tips (3)."""
 

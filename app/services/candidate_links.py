@@ -47,6 +47,17 @@ _ALLOWED_HOSTS = {
 
 _URL_PATTERN = re.compile(r"https?://[^\s\)\]\},\"'<>]+")
 
+#: Resumes almost never write the scheme — they print "github.com/you" under the name,
+#: and PDF extraction yields exactly that. Requiring https:// meant a resume with a
+#: GitHub and a LinkedIn link produced "No links found in resume.", so the interviewer
+#: had nothing to ask about even when the candidate pointed at their profile.
+#: Restricted to the hosts we would fetch anyway, so this widens extraction, not reach:
+#: classify() and assert_safe() still gate every request.
+_BARE_URL_PATTERN = re.compile(
+    r"(?<![@\w.])(?:www\.)?((?:github|linkedin|leetcode)\.com/[A-Za-z0-9._~%/-]+)",
+    re.IGNORECASE,
+)
+
 _MAX_URLS = 8
 
 
@@ -71,11 +82,19 @@ class ScrapeResult:
 def extract_urls(text: str) -> list[str]:
     seen: set[str] = set()
     found: list[str] = []
-    for raw in _URL_PATTERN.findall(text or ""):
-        url = raw.rstrip(".,;:)]}\"'")
-        if url not in seen:
-            seen.add(url)
+
+    def add(url: str) -> None:
+        url = url.rstrip(".,;:)]}\"'")
+        key = url.lower().replace("http://", "https://")
+        if key not in seen:
+            seen.add(key)
             found.append(url)
+
+    for raw in _URL_PATTERN.findall(text or ""):
+        add(raw)
+    # Scheme-less profile links, normalised so the rest of the pipeline sees a URL.
+    for host_and_path in _BARE_URL_PATTERN.findall(text or ""):
+        add(f"https://{host_and_path}")
     return found
 
 
