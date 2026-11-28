@@ -8,6 +8,7 @@ running with one.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -20,9 +21,23 @@ Env = Literal["local", "preview", "production"]
 _FORBIDDEN_SECRETS = {"secret", "changeme", "please-change-me", ""}
 
 
+def _env_file() -> str | None:
+    """Which dotenv file to load, if any.
+
+    `PLACEPREP_ENV_FILE=""` disables dotenv loading entirely. The test suite sets that,
+    so tests cannot read local credentials and therefore cannot reach — or pollute —
+    real Redis, Resend, Groq or Supabase. Before this, adding real values to `.env` made
+    six tests fail by silently hitting the live Upstash instance.
+    """
+    configured = os.getenv("PLACEPREP_ENV_FILE")
+    if configured is None:
+        return ".env"
+    return configured or None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_env_file(),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
@@ -76,13 +91,29 @@ class Settings(BaseSettings):
     LLM_MODEL_CHEAP: str = "openai/gpt-oss-20b"
     LLM_MODEL_FALLBACK: str = ""
     STT_MODEL: str = "whisper-large-v3-turbo"
+    # Per-1M-token prices as JSON, so a price change or a new model does not need a
+    # deploy: {"openai/gpt-oss-120b": [0.15, 0.60]}. Empty means use the built-in table.
+    LLM_PRICING_JSON: str = ""
 
+    # Groq's free tier allows far fewer concurrent requests than a paid key. This is
+    # the knob that adapts to the plan: raise it after upgrading, no code change.
     LLM_TIMEOUT_SEC: float = 20.0
     LLM_MAX_RETRIES: int = 2
     LLM_MAX_CONCURRENCY: int = 8
-    LLM_TOKEN_BUDGET_QUESTION: int = 200
-    LLM_TOKEN_BUDGET_GRADER: int = 600
-    LLM_TOKEN_BUDGET_EVALUATOR: int = 1_200
+    # These budgets include REASONING tokens. gpt-oss models emit reasoning before the
+    # answer and it counts against max_tokens, so a budget sized for the answer alone
+    # gets consumed by reasoning and the content comes back empty. Measured: a realistic
+    # question prompt used 108 completion tokens at default effort, 46 at "low".
+    LLM_TOKEN_BUDGET_QUESTION: int = 600
+    LLM_TOKEN_BUDGET_GRADER: int = 1_800
+    LLM_TOKEN_BUDGET_EVALUATOR: int = 3_000
+    LLM_TOKEN_BUDGET_CHEAP: int = 500
+    # Reasoning effort, passed through to Groq. "low" cut completion tokens roughly 4x
+    # with no loss of question quality; grading keeps more depth.
+    LLM_REASONING_EFFORT_FAST: str = "low"
+    LLM_REASONING_EFFORT_DEEP: str = "medium"
+    # Turn off if a future model rejects the parameter.
+    LLM_SEND_REASONING_EFFORT: bool = True
 
     # ── Google OAuth ──────────────────────────────────────────────────────────
     GOOGLE_CLIENT_ID: str = ""
@@ -110,17 +141,40 @@ class Settings(BaseSettings):
     SCRAPE_MAX_BYTES: int = 2_000_000
 
     # ── Notifications (OTP delivery) ──────────────────────────────────────────
-    # No provider is wired up yet; see services/notify.py. Locally codes go to the log.
+    # Email goes through Resend. Locally, with no key set, codes go to the log.
     EMAIL_FROM: str = "PlacePrep AI <no-reply@placeprepai.fun>"
     RESEND_API_KEY: str = ""
+    # SMS goes through MSG91. Kept behind a flag that stays false until the DLT
+    # template is approved: sending before then is rejected by the carrier, and a
+    # silent rejection looks exactly like a delivered message from our side.
+    SMS_ENABLED: bool = False
     SMS_API_KEY: str = ""
+    MSG91_TEMPLATE_ID: str = ""
+    MSG91_SENDER_ID: str = ""
     OTP_TTL_SEC: int = 600
     OTP_MAX_ATTEMPTS: int = 5
+
+    # ── Consent (India DPDP Act) ──────────────────────────────────────────────
+    # Bump a version when the notice text changes: an old consent then stops counting
+    # as current, and the student is asked again rather than silently carried over.
+    CONSENT_VERSION_PROCTORING: str = "2026-11-27"
+    CONSENT_VERSION_PROFILE: str = "2026-11-27"
+    CONSENT_VERSION_COLLEGE_SHARING: str = "2026-11-27"
+    # A proctored interview cannot start without a current proctoring consent.
+    REQUIRE_PROCTORING_CONSENT: bool = True
 
     # ── Scheduled jobs ────────────────────────────────────────────────────────
     # Vercel Cron sends this as a bearer token. Without it the cron endpoints
     # refuse to run rather than being callable by anyone.
     CRON_SECRET: str = ""
+    # How many queued jobs one cron invocation drains. On Vercel Hobby crons fire once
+    # a day, so this has to be generous; on Pro, where the schedule can be minutes,
+    # a smaller batch keeps each invocation short.
+    CRON_DRAIN_BATCH: int = 25
+    # A report that is still pending may drain its own evaluation job inline. This is
+    # what makes reports appear within seconds on Hobby, where the cron is daily.
+    # Turn it off once the cron runs frequently enough to keep up.
+    OPPORTUNISTIC_DRAIN: bool = True
 
     # ── Uploads ───────────────────────────────────────────────────────────────
     MAX_UPLOAD_BYTES: int = 5_242_880  # 5 MB
@@ -132,6 +186,13 @@ class Settings(BaseSettings):
     HARD_CUTOFF_MIN: int = 25
     WARMUP_QUESTIONS: int = 2
     FEEDBACK_EVERY_N: int = 3
+    # How many JD chunks are injected into a question prompt. Dropped by accident when
+    # this module was rewritten as pydantic-settings, which made every interview turn
+    # raise AttributeError in rag_service — caught by the first test that submitted a
+    # turn, not by the 129 that came before it.
+    TOP_K_JD_CHUNKS: int = 3
+    # Seconds between posture nudges, so the same warning is not repeated every frame.
+    POSTURE_WARN_COOLDOWN_SEC: int = 60
 
     # ── Tokens / quota ────────────────────────────────────────────────────────
     TOKEN_CONSUME_AFTER_ANSWERS: int = 3

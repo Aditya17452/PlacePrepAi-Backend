@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -37,3 +38,13 @@ class ConsentRequest(StrictModel):
     kind: Literal["proctoring", "profile_processing", "college_sharing"]
     version: str = Field(max_length=20)
     granted: bool = True
+
+
+class ConsentStatusOut(OutModel):
+    """One consent kind and whether this student's agreement is to the current notice."""
+
+    kind: Literal["proctoring", "profile_processing", "college_sharing"]
+    current_version: str
+    granted_version: str | None = None
+    granted_at: datetime | None = None
+    is_current: bool = False

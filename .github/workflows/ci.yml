@@ -62,3 +62,33 @@ jobs:
             echo "::error::A credential-shaped string is committed. Move it to an env var."
             exit 1
           fi
+
+  # The test job installs requirements-dev.txt with pip, which drags in setuptools and
+  # therefore hides a missing `pkg_resources`. Vercel installs with `uv sync --locked`
+  # and no dev extras, so this job reproduces *that* environment and imports the modules
+  # the app only imports lazily at request time. Without it, razorpay's
+  # `import pkg_resources` broke every payment in preview while CI stayed green.
+  deploy-env:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install exactly as Vercel does
+        run: uv sync --locked --no-dev
+      - name: Import every lazily imported integration
+        run: |
+          uv run --no-dev python - <<'PY'
+          import importlib
+
+          # Imported inside a function at runtime, so a missing dependency shows up as a
+          # 5xx on a live request rather than at boot or in the test suite.
+          for name in ("razorpay", "fitz", "pdfplumber", "docx", "groq", "redis"):
+              importlib.import_module(name)
+              print("ok", name)
+
+          # The razorpay client is what actually touches pkg_resources.
+          import razorpay
+          razorpay.Client(auth=("rzp_test_x", "y"))
+          print("ok razorpay.Client")
+          PY

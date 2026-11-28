@@ -15,6 +15,12 @@ import tempfile
 import uuid
 from pathlib import Path
 
+# Disable dotenv loading entirely. Without this the suite reads the developer's real
+# .env and talks to the live Upstash, Resend, Groq and Supabase — which is how six
+# tests started failing the moment real credentials were added to that file. A test
+# run must not be able to reach, or pollute, production infrastructure.
+os.environ["PLACEPREP_ENV_FILE"] = ""
+
 os.environ.setdefault("ENV", "local")
 os.environ.setdefault("JWT_SECRET", "test-secret-that-is-at-least-32-characters-long")
 os.environ.setdefault("ADMIN_BOOTSTRAP_EMAILS", "")

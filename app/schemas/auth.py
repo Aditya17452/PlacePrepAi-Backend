@@ -90,3 +90,22 @@ class SendOtpRequest(StrictModel):
 class VerifyOtpRequest(StrictModel):
     channel: Literal["email", "phone"]
     code: str = Field(min_length=4, max_length=8)
+
+
+class MfaSetupResponse(OutModel):
+    """Enrolment material for an authenticator app.
+
+    The secret is returned once, at enrolment, because that is the only way to put it
+    into an authenticator. It is the caller's own second factor and is useless without
+    their password.
+    """
+
+    secret: str
+    otpauth_uri: str
+    issuer: str
+    account: str
+    already_enabled: bool = False
+
+
+class MfaConfirmRequest(StrictModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")

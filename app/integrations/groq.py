@@ -25,8 +25,14 @@ class Provider:
         temperature: float,
         json_mode: bool,
         timeout: float,
-    ) -> tuple[str, int, int]:
-        """Return (text, prompt_tokens, completion_tokens)."""
+        reasoning_effort: str | None = None,
+    ) -> tuple[str, int, int, str]:
+        """Return (text, prompt_tokens, completion_tokens, finish_reason).
+
+        `finish_reason` matters for reasoning models: "length" means the budget ran out,
+        which is a different failure from the model declining to answer, and the caller
+        needs to tell them apart.
+        """
         raise NotImplementedError
 
     async def transcribe(
@@ -50,7 +56,8 @@ class GroqProvider(Provider):
         temperature: float,
         json_mode: bool,
         timeout: float,
-    ) -> tuple[str, int, int]:
+        reasoning_effort: str | None = None,
+    ) -> tuple[str, int, int, str]:
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -60,14 +67,19 @@ class GroqProvider(Provider):
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if reasoning_effort:
+            # Not a named parameter in the installed SDK, so it goes through extra_body.
+            kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
 
         resp = await self._client.chat.completions.create(**kwargs)
-        text = (resp.choices[0].message.content or "").strip()
+        choice = resp.choices[0]
+        text = (choice.message.content or "").strip()
         usage = getattr(resp, "usage", None)
         return (
             text,
             int(getattr(usage, "prompt_tokens", 0) or 0),
             int(getattr(usage, "completion_tokens", 0) or 0),
+            str(getattr(choice, "finish_reason", "") or ""),
         )
 
     async def transcribe(

@@ -12,9 +12,10 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Request, status
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from app.api.deps import DbSession
+from app.core import kv
 from app.core.config import settings
 from app.core.logging_setup import get_logger
 from app.models import ProctoringEvent, TokenLedger, TokenLot, TokenWallet, utcnow
@@ -44,21 +45,68 @@ def _authorise(request: Request) -> None:
 @router.post("/drain-jobs")
 @router.get("/drain-jobs")
 async def drain_jobs(request: Request, db: DbSession) -> dict:
-    """Run queued background work: evaluations, JD matches, context builds."""
+    """Run queued background work: evaluations, JD matches, context builds.
+
+    Kept as its own endpoint so the queue can be nudged by hand, and so a Pro project
+    can schedule it every few minutes instead of relying on `maintenance`.
+    """
     _authorise(request)
     requeued = jobs.requeue_stale(db)
-    result = await jobs.drain(db, limit=10)
+    result = await jobs.drain(db, limit=settings.CRON_DRAIN_BATCH)
     return {"requeued_stale": requeued, **result}
 
 
 @router.post("/maintenance")
 @router.get("/maintenance")
 async def maintenance(request: Request, db: DbSession) -> dict:
-    """Daily housekeeping: expire token lots, purge old proctoring snapshots."""
+    """Daily housekeeping: drain the queue, expire token lots, purge snapshots.
+
+    Draining is folded in here because **Vercel Hobby runs cron jobs once a day and
+    allows only two per project**. One of the two slots is the keep-alive below, so this
+    one has to do all the periodic work. On Pro, split it back out and raise the
+    schedule to minutes.
+    """
     _authorise(request)
+    requeued = jobs.requeue_stale(db)
+    drained = await jobs.drain(db, limit=settings.CRON_DRAIN_BATCH)
     expired = _expire_token_lots(db)
     purged = await _purge_snapshots(db)
-    return {"lots_expired": expired, "snapshots_purged": purged}
+    return {
+        "requeued_stale": requeued,
+        **drained,
+        "lots_expired": expired,
+        "snapshots_purged": purged,
+    }
+
+
+@router.post("/keepalive")
+@router.get("/keepalive")
+async def keepalive(request: Request, db: DbSession) -> dict:
+    """Touch the database and Redis so a Free-tier Supabase project does not pause.
+
+    Supabase pauses a Free project after a week without activity, and an auto-paused
+    project looks exactly like an outage to a student mid-interview. A daily read is
+    enough to keep it awake.
+
+    Deliberately does real work rather than just returning 200: a request that never
+    reaches Postgres would keep the cron green while the project paused anyway.
+    """
+    _authorise(request)
+
+    db_ok = False
+    students = 0
+    try:
+        students = int(db.execute(text("SELECT count(*) FROM students")).scalar() or 0)
+        db_ok = True
+    except Exception as exc:
+        log.error("keepalive_db_failed", error=str(exc)[:200])
+
+    redis_ok = await kv.healthy()
+    if not redis_ok:
+        log.warning("keepalive_redis_unreachable")
+
+    log.info("keepalive", database=db_ok, redis=redis_ok, students=students)
+    return {"database": db_ok, "redis": redis_ok}
 
 
 def _expire_token_lots(db: DbSession) -> int:  # type: ignore[valid-type]

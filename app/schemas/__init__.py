@@ -18,6 +18,8 @@ from app.schemas.admin import (
 from app.schemas.auth import (
     LoginRequest,
     MeResponse,
+    MfaConfirmRequest,
+    MfaSetupResponse,
     OAuthExchangeRequest,
     OAuthUrlResponse,
     RegisterRequest,
@@ -28,6 +30,7 @@ from app.schemas.auth import (
 from app.schemas.candidate import (
     CandidateLinkIn,
     ConsentRequest,
+    ConsentStatusOut,
     JDMatchOut,
     ResumeUploadResponse,
 )
@@ -96,6 +99,8 @@ __all__ = [
     "LoginRequest",
     "TokenResponse",
     "MeResponse",
+    "MfaSetupResponse",
+    "MfaConfirmRequest",
     "OAuthUrlResponse",
     "OAuthExchangeRequest",
     "SendOtpRequest",
@@ -105,6 +110,7 @@ __all__ = [
     "ResumeUploadResponse",
     "CandidateLinkIn",
     "ConsentRequest",
+    "ConsentStatusOut",
     # Job descriptions
     "SubmitJDRequest",
     "StudentJDOut",

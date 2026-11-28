@@ -24,6 +24,7 @@ from app.api.v1.routers import (
     admin,
     auth,
     college_admin,
+    consents,
     cron,
     interviews,
     jd,
@@ -50,6 +51,7 @@ log = get_logger("app")
 
 ROUTERS = (
     auth.router,
+    consents.router,
     resume.router,
     jd.router,
     interviews.router,

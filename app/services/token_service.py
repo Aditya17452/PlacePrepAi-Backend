@@ -408,7 +408,7 @@ def reserve_for_interview(
     then the personal wallet.
     """
     _assert_no_active_interview(db, student, session_id)
-    _assert_daily_cap(db, student)
+    _assert_daily_cap(db, student, session_id)
 
     college = _active_college(db, student)
 
@@ -595,7 +595,7 @@ def _assert_no_active_interview(
         )
 
 
-def _assert_daily_cap(db: Session, student: Student) -> None:
+def _assert_daily_cap(db: Session, student: Student, new_session_id: str) -> None:
     college = _active_college(db, student)
     cap = int(
         (college.daily_interview_cap if college else None)
@@ -607,6 +607,10 @@ def _assert_daily_cap(db: Session, student: Student) -> None:
         .filter(
             InterviewSession.student_id == str(student.id),
             InterviewSession.started_at >= since,
+            # The caller creates the session row and *then* reserves, so autoflush makes
+            # the row being created visible to this count. Without this exclusion the cap
+            # is off by one and a cap of 3 only ever allows 2 interviews.
+            InterviewSession.id != new_session_id,
         )
         .scalar()
         or 0

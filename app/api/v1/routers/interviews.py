@@ -49,7 +49,7 @@ from app.schemas import (
     SubmitTurnRequest,
     SubmitTurnResponse,
 )
-from app.services import interview_agent, session_service, token_service
+from app.services import consent, interview_agent, session_service, token_service
 from app.services.interview_flow import (
     candidate_profile,
     decode_audio,
@@ -61,6 +61,7 @@ from app.services.interview_flow import (
 from app.services.jd_context import jd_labels, jd_text_for
 from app.services.rag_service import retrieve_jd_context
 from app.services.session_service import InterviewState
+from app.workers import jobs
 
 log = get_logger("interviews")
 
@@ -83,6 +84,18 @@ async def start_interview(
     student = db.query(Student).filter(Student.id == principal.id).first()
     if student is None:  # pragma: no cover
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+
+    # A proctored session records camera and microphone observations, so it cannot start
+    # without a current proctoring consent. Checked here rather than trusted from the
+    # client, which is where the agreement used to live and nowhere else.
+    if body.proctoring_enabled and settings.REQUIRE_PROCTORING_CONSENT:
+        if not consent.has_current(db, student_id=principal.id, kind="proctoring"):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Proctoring consent is required before a proctored interview can start. "
+                f"Accept the current notice (version {consent.current_version('proctoring')}) "
+                "and try again.",
+            )
 
     role_title, company = "", ""
     if body.custom_jd_id:
@@ -393,6 +406,18 @@ async def get_report(
         .filter(ProctoringSummary.session_id == session_id)
         .first()
     )
+
+    if score is not None and score.evaluation_status == "pending" and settings.OPPORTUNISTIC_DRAIN:
+        # On Vercel Hobby the cron runs once a day, so waiting for it would leave this
+        # report "processing" for up to 24 hours. Run this session's own evaluation now.
+        # Claimed the same way the worker claims it, so a concurrent cron cannot double-run.
+        if await jobs.drain_one(db, dedupe_key=f"evaluate:{session_id}"):
+            db.expire_all()
+            score = (
+                db.query(SessionScore)
+                .filter(SessionScore.session_id == session_id)
+                .first()
+            )
 
     if score is None or score.evaluation_status == "pending":
         return ReportResponse(

@@ -177,6 +177,45 @@ def test_daily_cap_is_enforced(db):
         token_service.reserve_for_interview(db, student=student, session_id="session-7")
 
 
+def test_daily_cap_does_not_count_the_session_being_created(db):
+    """The router adds the session row and flushes it, then reserves — so the cap sees it.
+
+    The cap check must exclude it. Without the exclusion a cap of 3 only ever allowed 2
+    interviews, which is how it reached a deployed preview: the older test above never
+    created the new row, so it passed either way.
+    """
+    from app.models import InterviewSession, utcnow
+
+    student = make_student(db, tokens=10)
+    for index in range(2):  # one under the default cap of 3
+        db.add(
+            InterviewSession(
+                id=f"earlier-{index}",
+                student_id=str(student.id),
+                jd_id="jd",
+                status="completed",
+                started_at=utcnow(),
+            )
+        )
+    db.commit()
+
+    # Exactly what the router does: add the row, flush it, then reserve against it.
+    db.add(
+        InterviewSession(
+            id="session-cap-boundary",
+            student_id=str(student.id),
+            jd_id="jd",
+            status="active",
+            started_at=utcnow(),
+        )
+    )
+    db.flush()
+    reservation = token_service.reserve_for_interview(
+        db, student=student, session_id="session-cap-boundary"
+    )
+    assert reservation is not None
+
+
 def test_balance_never_goes_negative(db):
     student = make_student(db, tokens=1)
     token_service.reserve_for_interview(db, student=student, session_id="session-8")
