@@ -427,3 +427,57 @@ def test_revoke_cannot_take_reserved_or_spent_tokens(db):
     wallet = _wallet(db, "student", str(student.id))
     assert wallet.balance == 1
     assert wallet.reserved == 1
+
+
+def test_a_stale_active_session_does_not_block_a_new_interview(db):
+    """A tab closed weeks ago must not lock the student out forever.
+
+    Production had sessions stuck "active" since May — six months — which made every
+    start return "You already have an interview in progress."
+    """
+    from datetime import timedelta
+
+    from app.models import InterviewSession, utcnow
+
+    student = make_student(db, tokens=10)
+    db.add(
+        InterviewSession(
+            id="walked-away",
+            student_id=str(student.id),
+            jd_id="jd",
+            status="active",
+            started_at=utcnow() - timedelta(days=180),
+        )
+    )
+    db.commit()
+
+    reservation = token_service.reserve_for_interview(
+        db, student=student, session_id="session-after-stale"
+    )
+    assert reservation is not None
+
+    stale = db.query(InterviewSession).filter(InterviewSession.id == "walked-away").first()
+    assert stale.status == "abandoned"
+    assert stale.ended_at is not None
+
+
+def test_a_recent_active_session_still_blocks(db):
+    """The guard must keep working for an interview actually in progress."""
+    from app.models import InterviewSession, utcnow
+
+    student = make_student(db, tokens=10)
+    db.add(
+        InterviewSession(
+            id="in-progress",
+            student_id=str(student.id),
+            jd_id="jd",
+            status="active",
+            started_at=utcnow(),
+        )
+    )
+    db.commit()
+
+    with pytest.raises(token_service.InterviewAlreadyActive):
+        token_service.reserve_for_interview(
+            db, student=student, session_id="session-blocked"
+        )

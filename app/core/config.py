@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     MAX_AUTO_RELEASES_PER_DAY: int = 2
     DEFAULT_COLLEGE_MONTHLY_ALLOWANCE: int = 4
     DEFAULT_DAILY_INTERVIEW_CAP: int = 3
+    #: An interview left open this long is treated as abandoned. Nothing closes a session
+    #: when the student closes the tab, so without this one orphaned row blocks every
+    #: future start for that student — production had sessions stuck "active" for six
+    #: months. Comfortably longer than the longest real interview (12 questions).
+    INTERVIEW_ABANDON_AFTER_MIN: int = 90
     FREE_TIER_TOKENS: int = 2
     COLLEGE_POOL_VALIDITY_DAYS: int = 365
 

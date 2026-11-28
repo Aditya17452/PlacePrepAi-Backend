@@ -577,9 +577,49 @@ def _oldest_live_lot(db: Session, wallet: TokenWallet) -> TokenLot | None:
 # ── Abuse guards ──────────────────────────────────────────────────────────────
 
 
+def abandon_stale_sessions(db: Session, *, student_id: str | None = None) -> int:
+    """Close interviews left open past the abandonment window, releasing their tokens.
+
+    Nothing marks a session finished when the student closes the tab, so an orphaned
+    "active" row blocks every future start for that student. Production accumulated
+    sessions stuck active for six months, which locked two real accounts out entirely.
+
+    Caller commits. Releasing is idempotent, and a session with no reservation (one
+    started before the token ledger existed) is simply closed.
+    """
+    cutoff = utcnow() - timedelta(minutes=settings.INTERVIEW_ABANDON_AFTER_MIN)
+    query = db.query(InterviewSession).filter(
+        InterviewSession.status == "active",
+        InterviewSession.started_at < cutoff,
+    )
+    if student_id is not None:
+        query = query.filter(InterviewSession.student_id == student_id)
+
+    closed = 0
+    for session in query.all():
+        session.status = "abandoned"
+        session.ended_at = utcnow()
+        release_for_interview(
+            db, session_id=str(session.id), reason="Interview abandoned"
+        )
+        closed += 1
+
+    if closed:
+        # Flush explicitly rather than trusting autoflush: the caller immediately queries
+        # for active sessions, and a Session configured without autoflush would still see
+        # the rows as active and refuse the start.
+        db.flush()
+        log.info("sessions_abandoned", count=closed, student_id=student_id)
+    return closed
+
+
 def _assert_no_active_interview(
     db: Session, student: Student, new_session_id: str
 ) -> None:
+    # Clear this student's stale sessions first, so an interview they walked away from
+    # weeks ago does not refuse them forever. Only genuinely recent ones block a start.
+    abandon_stale_sessions(db, student_id=str(student.id))
+
     active = (
         db.query(InterviewSession)
         .filter(

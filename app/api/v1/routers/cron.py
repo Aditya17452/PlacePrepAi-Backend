@@ -19,7 +19,7 @@ from app.core import kv
 from app.core.config import settings
 from app.core.logging_setup import get_logger
 from app.models import ProctoringEvent, TokenLedger, TokenLot, TokenWallet, utcnow
-from app.services import storage
+from app.services import storage, token_service
 from app.workers import jobs
 
 log = get_logger("cron")
@@ -71,11 +71,17 @@ async def maintenance(request: Request, db: DbSession) -> dict:
     drained = await jobs.drain(db, limit=settings.CRON_DRAIN_BATCH)
     expired = _expire_token_lots(db)
     purged = await _purge_snapshots(db)
+    # Sessions the student walked away from: close them and hand the token back. The
+    # start path also does this for the student in front of us, so nobody waits a day
+    # to be unblocked; this sweep catches everyone else and frees held tokens.
+    abandoned = token_service.abandon_stale_sessions(db)
+    db.commit()
     return {
         "requeued_stale": requeued,
         **drained,
         "lots_expired": expired,
         "snapshots_purged": purged,
+        "sessions_abandoned": abandoned,
     }
 
 
