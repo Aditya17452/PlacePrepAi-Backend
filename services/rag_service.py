@@ -1,117 +1,147 @@
+"""Retrieving the parts of a job description relevant to what the candidate just said.
+
+Two things were wrong before:
+
+* `get_embedder()` imported `sentence-transformers` — a ~2 GB torch install — and had no
+  call sites anywhere. Retrieval has always been keyword-based. The dependency is gone.
+* `jd_chunks` was **empty in production** (0 rows), so `retrieve_jd_context` returned
+  "No specific JD requirements found." on every single turn. Every "JD-aware" question
+  was really generated from the role title alone. `index_jd` is now called whenever a JD
+  is created or edited, and a backfill migration indexes the existing rows.
+
+Still keyword search, deliberately: it is free, it works for the volumes involved, and
+PLAN.md §0 defers pgvector to Phase 3 where it can be judged against the engine.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from sqlalchemy import text
-from models.database import SessionLocal, JDChunk
+import re
+
+from sqlalchemy.orm import Session
+
 from core.config import settings
+from core.logging_setup import get_logger
+from models.database import JDChunk, SessionLocal
 
-_embedder = None
+log = get_logger("rag")
 
-def get_embedder():
-    # Still load embedder — used for future upgrade
-    # For now we use keyword search in MySQL
-    global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer(settings.EMBEDDING_MODEL)
-    return _embedder
+CHUNK_WORDS = 150
+
+#: Words too common to discriminate between chunks.
+_STOPWORDS = frozenset(
+    {
+        "about",
+        "above",
+        "after",
+        "again",
+        "because",
+        "been",
+        "before",
+        "being",
+        "between",
+        "could",
+        "doing",
+        "during",
+        "other",
+        "should",
+        "their",
+        "there",
+        "these",
+        "thing",
+        "things",
+        "those",
+        "through",
+        "using",
+        "where",
+        "which",
+        "while",
+        "would",
+        "really",
+        "basically",
+        "actually",
+    }
+)
 
 
-async def retrieve_jd_context(student_answer: str, jd_id: str) -> str:
+def keywords(text: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z+#.]{3,}", (text or "").lower())
+    seen: set[str] = set()
+    result: list[str] = []
+    for word in words:
+        if word in _STOPWORDS or word in seen:
+            continue
+        seen.add(word)
+        result.append(word)
+    return result
+
+
+async def retrieve_jd_context(answer: str, jd_id: str) -> str:
+    """Chunks of the JD most relevant to the candidate's answer.
+
+    Runs the blocking query in a thread so it does not stall the event loop.
     """
-    MySQL version — uses keyword matching instead of vector search.
-    Finds JD chunks that contain words from the student's answer.
-    Works well for 3-4 JDs in MVP.
-    """
-    chunks = await asyncio.to_thread(_keyword_search, student_answer, jd_id)
+    chunks = await asyncio.to_thread(_search, answer, jd_id)
     if not chunks:
-        # Fallback — return first 3 chunks of JD
-        chunks = await asyncio.to_thread(_get_first_chunks, jd_id)
-    if not chunks:
-        return "No specific JD requirements found."
-    return "\n".join(f"- {c}" for c in chunks)
+        return ""
+    return "\n".join(f"- {chunk}" for chunk in chunks)
 
 
-def _keyword_search(answer: str, jd_id: str) -> list[str]:
-    """Find chunks containing keywords from the student's answer."""
+def _search(answer: str, jd_id: str) -> list[str]:
     db = SessionLocal()
     try:
-        # Extract meaningful keywords (words > 4 chars)
-        words = [w.lower() for w in answer.split() if len(w) > 4]
-        if not words:
-            return _get_first_chunks(jd_id)
+        terms = keywords(answer)[:6]
+        found: list[str] = []
+        seen: set[str] = set()
 
-        # Search for chunks containing any of the keywords
-        # Use LIKE for simplicity — works fine for small JD sets
-        results = []
-        seen = set()
-
-        for word in words[:5]:  # check top 5 keywords
-            rows = db.execute(text("""
-                SELECT chunk_text FROM jd_chunks
-                WHERE jd_id = :jd_id
-                AND LOWER(chunk_text) LIKE :word
-                LIMIT 2
-            """), {
-                "jd_id": jd_id,
-                "word": f"%{word}%"
-            }).fetchall()
-
-            for row in rows:
-                if row[0] not in seen:
-                    seen.add(row[0])
-                    results.append(row[0])
-
-            if len(results) >= settings.TOP_K_JD_CHUNKS:
+        for term in terms:
+            rows = (
+                db.query(JDChunk.chunk_text)
+                .filter(
+                    JDChunk.jd_id == jd_id,
+                    JDChunk.chunk_text.ilike(f"%{term}%"),
+                )
+                .limit(2)
+                .all()
+            )
+            for (chunk_text,) in rows:
+                if chunk_text and chunk_text not in seen:
+                    seen.add(chunk_text)
+                    found.append(chunk_text)
+            if len(found) >= settings.TOP_K_JD_CHUNKS:
                 break
 
-        return results[:settings.TOP_K_JD_CHUNKS]
+        if not found:
+            found = _first_chunks(db, jd_id)
+        return found[: settings.TOP_K_JD_CHUNKS]
     finally:
         db.close()
 
 
-def _get_first_chunks(jd_id: str) -> list[str]:
-    """Fallback — return first N chunks of the JD."""
-    db = SessionLocal()
-    try:
-        rows = db.execute(text("""
-            SELECT chunk_text FROM jd_chunks
-            WHERE jd_id = :jd_id
-            ORDER BY chunk_index
-            LIMIT :k
-        """), {"jd_id": jd_id, "k": settings.TOP_K_JD_CHUNKS}).fetchall()
-        return [r[0] for r in rows]
-    finally:
-        db.close()
+def _first_chunks(db: Session, jd_id: str) -> list[str]:
+    rows = (
+        db.query(JDChunk.chunk_text)
+        .filter(JDChunk.jd_id == jd_id)
+        .order_by(JDChunk.chunk_index)
+        .limit(settings.TOP_K_JD_CHUNKS)
+        .all()
+    )
+    return [row[0] for row in rows if row[0]]
 
 
-def embed_jd(jd_id: str, jd_text: str):
+def index_jd(db: Session, jd_id: str, jd_text: str) -> int:
+    """Split a JD into chunks and store them. Replaces any existing chunks.
+
+    Caller commits. Returns the number of chunks written.
     """
-    For MySQL — just split and store chunks as text.
-    No vector embedding needed for keyword search.
-    """
-    db = SessionLocal()
-    try:
-        # Delete old chunks
-        db.execute(text(
-            "DELETE FROM jd_chunks WHERE jd_id = :id"
-        ), {"id": jd_id})
-        db.commit()
+    db.query(JDChunk).filter(JDChunk.jd_id == jd_id).delete(synchronize_session=False)
 
-        # Split into 150-word chunks
-        words = jd_text.split()
-        chunks = [
-            " ".join(words[i:i+150])
-            for i in range(0, len(words), 150)
-        ]
+    words = (jd_text or "").split()
+    chunks = [
+        " ".join(words[i : i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)
+    ]
+    for index, chunk_text in enumerate(chunks):
+        db.add(JDChunk(jd_id=jd_id, chunk_text=chunk_text, chunk_index=index))
 
-        for idx, chunk_text in enumerate(chunks):
-            chunk = JDChunk(
-                jd_id=jd_id,
-                chunk_text=chunk_text,
-                chunk_index=idx
-                # No embedding column in MySQL version
-            )
-            db.add(chunk)
-        db.commit()
-        print(f"✅ Stored {len(chunks)} chunks for JD {jd_id}")
-    finally:
-        db.close()
+    log.info("jd_indexed", jd_id=jd_id, chunks=len(chunks))
+    return len(chunks)

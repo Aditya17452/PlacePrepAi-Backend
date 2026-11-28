@@ -1,19 +1,50 @@
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-python-dotenv==1.0.0
-sqlalchemy==2.0.29
-aiosqlite==0.20.0
-psycopg2-binary==2.9.9
-redis==5.0.4
-groq==0.9.0
-SpeechRecognition==3.10.4
-pydub==0.25.1
-sentence-transformers==2.7.0
-python-multipart==0.0.9
-websockets==12.0
-httpx==0.27.0
-PyPDF2==3.0.1
-PyJWT==2.8.0
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# ── Config & validation ───────────────────────────────────────────────────────
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+SQLAlchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+PyJWT==2.10.1
+bcrypt==4.2.1
+pyotp==2.9.0
+
+# ── HTTP / external services ──────────────────────────────────────────────────
+httpx==0.28.1
+groq==0.13.1
 razorpay==1.4.2
+redis==5.2.1
+
+# ── Documents ─────────────────────────────────────────────────────────────────
+# pdfplumber was called by api/resume.py but never declared, so production silently
+# fell back to PyPDF2. Both it and a PyMuPDF fallback are now explicit.
+pdfplumber==0.11.4
+PyMuPDF==1.25.1
+python-docx==1.1.2
+
+# ── HTML parsing (portfolio pages) ────────────────────────────────────────────
 beautifulsoup4==4.12.3
-lxml==5.2.1
+lxml==5.3.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+structlog==24.4.0
+sentry-sdk[fastapi]==2.19.2
+
+# Removed in Phase 1:
+#   sentence-transformers  — get_embedder() had no call sites; a ~2 GB torch install on
+#                            every build, and far over Vercel's 250 MB function limit.
+#   SpeechRecognition      — unused; transcription goes through Groq Whisper.
+#   pydub                  — unused, and needs ffmpeg at runtime.
+#   websockets             — the interview is turn-based HTTP now (PLAN.md §0.1).
+#   aiosqlite              — production is Postgres; tests use sync SQLite.
+#   PyPDF2                 — superseded by pdfplumber + PyMuPDF.
+#   python-dotenv          — pydantic-settings reads .env itself.

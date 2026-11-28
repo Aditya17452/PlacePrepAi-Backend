@@ -1,0 +1,28 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 95
+target-version = "py311"
+exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.isort]
+# Declared explicitly rather than inferred: ruff's src detection depends on the
+# checkout path, so without this the same file passes in one clone and fails in
+# another with a spurious I001.
+known-first-party = [
+  "agents",
+  "api",
+  "core",
+  "data",
+  "models",
+  "scripts",
+  "services",
+  "tests",
+]
