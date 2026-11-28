@@ -48,6 +48,10 @@ jobs:
       - name: Check migrations render
         env:
           DATABASE_URL: postgresql://user:pass@localhost:5432/placeprep
+          # alembic/env.py imports app.core.config, so the startup validator runs here
+          # too and rejects an unset JWT_SECRET. Without this the step cannot even load
+          # env.py, which is what turned this job red.
+          JWT_SECRET: ci-secret-that-is-at-least-32-characters-long
         # Catches a migration that does not even compile, without needing a database.
         # 0003 moves data and refuses offline mode, so only the schema steps are rendered.
         run: alembic upgrade 0002_phase1_foundation --sql > /dev/null
