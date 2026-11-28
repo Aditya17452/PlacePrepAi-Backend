@@ -265,6 +265,7 @@ async def complete_structured(
     max_tokens: int | None = None,
     session_id: str | None = None,
     student_id: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> T:
     """Completion validated against a Pydantic model.
 
@@ -285,6 +286,7 @@ async def complete_structured(
             json_mode=True,
             session_id=session_id,
             student_id=student_id,
+            reasoning_effort=reasoning_effort,
         )
         try:
             return schema.model_validate(json.loads(_strip_json_fence(text)))
@@ -351,9 +353,14 @@ async def _complete(
     json_mode: bool,
     session_id: str | None,
     student_id: str | None,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, Usage]:
     model = model_for(task)
     budget = max_tokens or budget_for(task)
+    # Reasoning tokens dominate latency on gpt-oss, so a caller that needs a cheap,
+    # shallow answer from an otherwise "deep" task can say so without changing the
+    # task's default for everyone else.
+    effort = reasoning_effort or reasoning_effort_for(task)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -384,7 +391,7 @@ async def _complete(
                         temperature=temperature,
                         json_mode=json_mode,
                         timeout=settings.LLM_TIMEOUT_SEC,
-                        reasoning_effort=reasoning_effort_for(task),
+                        reasoning_effort=effort,
                     )
                 usage.prompt_tokens = prompt_tokens
                 usage.completion_tokens = completion_tokens
@@ -446,7 +453,7 @@ async def _complete(
                     temperature=temperature,
                     json_mode=json_mode,
                     timeout=settings.LLM_TIMEOUT_SEC,
-                    reasoning_effort=reasoning_effort_for(task),
+                    reasoning_effort=effort,
                 )
             usage = Usage(
                 model=fallback_model,

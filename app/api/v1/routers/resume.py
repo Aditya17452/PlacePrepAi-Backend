@@ -232,6 +232,10 @@ Include every JD_ID listed, using the exact ids given."""
             temperature=0.2,
             max_tokens=1_200,
             student_id=student_id,
+            # Ranking a resume against six short JDs is a comparison, not a judgement
+            # call, and this runs while the student waits on the upload. At the default
+            # "deep" effort the reasoning tokens made this call ~4.6s of a 5.5s request.
+            reasoning_effort=settings.LLM_REASONING_EFFORT_FAST,
         )
         ranked = matches.ranked
     except LLMError as exc:
