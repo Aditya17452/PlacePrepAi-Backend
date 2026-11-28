@@ -16,6 +16,9 @@ Fixes in Phase 1:
 
 from __future__ import annotations
 
+import asyncio
+from time import perf_counter
+
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
@@ -59,6 +62,7 @@ async def upload_resume(
     """Store a resume, enrich it from the candidate's public profiles, match it to roles."""
     await ratelimit.limit_upload(request, principal.id)
 
+    t_start = perf_counter()
     data = await _read_capped(resume)
     try:
         text = document_text.extract(data, resume.filename or "")
@@ -75,8 +79,16 @@ async def upload_resume(
     if student is None:  # pragma: no cover
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
 
-    # Keep the original in a private bucket; never on local disk.
-    if storage.is_configured():
+    jds = db.query(JobDescription).filter(JobDescription.is_active.is_(True)).all()
+
+    # These three are independent network calls — a Supabase upload, profile scraping,
+    # and the matching model. Run concurrently instead of one after another: they used to
+    # be sequential, which is most of why this endpoint took 9-10 seconds. The database
+    # session is deliberately not touched inside them; a Session is not safe to share
+    # across concurrent tasks, so every write happens after they finish.
+    async def _store() -> None:
+        if not storage.is_configured():
+            return
         try:
             await storage.upload(
                 bucket=settings.SUPABASE_RESUME_BUCKET,
@@ -88,9 +100,16 @@ async def upload_resume(
             # Losing the file copy is acceptable; losing the upload is not.
             log.warning("resume_file_not_stored", error=str(exc)[:160])
 
+    t_parse = perf_counter()
+    _, scrape, suggestions = await asyncio.gather(
+        _store(),
+        candidate_links.scrape_resume_links(text),
+        _rank_jds(text, jds, student_id=principal.id),
+    )
+    t_io = perf_counter()
+
     student.resume_text = text
 
-    scrape = await candidate_links.scrape_resume_links(text)
     if scrape.summary:
         profile = (
             db.query(StudentProfileData)
@@ -118,7 +137,16 @@ async def upload_resume(
     )
     db.commit()
 
-    suggestions = await _match_to_jds(db, text, student_id=principal.id)
+    log.info(
+        "resume_upload_timing",
+        bytes=len(data),
+        chars=len(text),
+        parse_ms=int((t_parse - t_start) * 1000),
+        io_ms=int((t_io - t_parse) * 1000),
+        total_ms=int((perf_counter() - t_start) * 1000),
+        jds=len(jds),
+        urls_fetched=scrape.urls_fetched,
+    )
     return ResumeUploadResponse(status="ready", suggestions=suggestions)
 
 
@@ -164,12 +192,15 @@ async def _read_capped(upload: UploadFile) -> bytes:
     return b"".join(chunks)
 
 
-async def _match_to_jds(
-    db: DbSession, resume_text: str, *, student_id: str  # type: ignore[valid-type]
+async def _rank_jds(
+    resume_text: str, jds: list[JobDescription], *, student_id: str
 ) -> list[JDMatchOut]:
-    jds = (
-        db.query(JobDescription).filter(JobDescription.is_active.is_(True)).all()
-    )
+    """Rank a resume against already-loaded JDs.
+
+    Takes the rows rather than a Session so it can run concurrently with the other
+    network calls in the upload handler — a Session must not be used from two tasks at
+    once.
+    """
     if not jds:
         return []
 

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, DbSession
 from app.core import audit, ratelimit
+from app.core.config import settings
 from app.core.logging_setup import get_logger
 from app.models import StudentJD
 from app.schemas import SimpleOk, StudentJDOut, SubmitJDRequest
@@ -118,6 +119,17 @@ async def jd_status(
     jd_id: str, principal: CurrentUser, db: DbSession
 ) -> StudentJDOut:
     row = _own_jd(db, jd_id, principal.id)
+
+    if row.status == "pending" and settings.OPPORTUNISTIC_DRAIN:
+        # Nothing else runs this job between cron ticks, and on Vercel Hobby cron fires
+        # once a day — so a client polling this endpoint would poll for up to 24 hours
+        # while the JD sat at "pending". Run this JD's own match job now, the same way
+        # the report endpoint drains its evaluation. Claimed like the worker claims it,
+        # so a concurrent cron run cannot execute it twice.
+        if await jobs.drain_one(db, dedupe_key=f"match_jd:{jd_id}"):
+            db.expire_all()
+            row = _own_jd(db, jd_id, principal.id)
+
     return _to_out(row)
 
 
