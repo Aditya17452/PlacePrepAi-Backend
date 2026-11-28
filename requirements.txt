@@ -39,6 +39,12 @@ lxml==5.3.0
 structlog==24.4.0
 sentry-sdk[fastapi]==2.19.2
 
+# ── Transitive, but required explicitly ───────────────────────────────────────
+# razorpay 1.4.2 does `import pkg_resources` (setuptools) at module level. pip left
+# setuptools in every environment; `uv sync` does not, so without this every
+# create-order and refund fails with "No module named 'pkg_resources'".
+setuptools==75.6.0
+
 # Removed in Phase 1:
 #   sentence-transformers  — get_embedder() had no call sites; a ~2 GB torch install on
 #                            every build, and far over Vercel's 250 MB function limit.

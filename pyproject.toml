@@ -33,6 +33,11 @@ dependencies = [
   "lxml==5.3.0",
   "structlog==24.4.0",
   "sentry-sdk[fastapi]==2.19.2",
+  # razorpay 1.4.2's client.py does `import pkg_resources` at module level, which lives
+  # in setuptools. pip used to leave setuptools in every environment, so this was
+  # invisible; `uv sync` does not, so on Vercel every create-order and refund returned
+  # 502 with "No module named 'pkg_resources'". Keep this until razorpay drops it.
+  "setuptools==75.6.0",
 ]
 
 [project.optional-dependencies]
